@@ -1,0 +1,66 @@
+#!/bin/sh
+# /usr/local/sbin/battery-limits - ThinkPad charge limits by place. On the dock (any Thunderbolt
+# device connected) the battery stays between 75 and 80 %: it lives plugged in and warm, the case
+# where a limit helps. Anywhere else it charges to 100 %: you are on the move, and a few cycles at
+# full charge cost little.
+#   sudo battery-limits          apply the rule (run at boot by /etc/local.d/battery.start and by
+#                                udev when the dock comes or goes)
+#   sudo battery-limits full     charge to 100 % now, on the dock too, until you undock or reboot -
+#                                before a trip (80 to 100 % takes about an hour)
+#   sudo battery-limits normal   back to the rule
+#   battery-limits status        where the laptop is, the limits, the battery
+# The values below: change them in files/battery-limits of the gentoo-laptop checkout, then
+# sudo ./deploy. Docked between the limits the battery reports "Not charging" and the panel shows
+# no charging sign: expected (it charges again below the lower limit).
+DOCK_START=75 DOCK_END=80      # on the dock
+AWAY_START=99 AWAY_END=100     # anywhere else, and after "full"
+PS="${BATTERY_LIMITS_PS:-/sys/class/power_supply}"            # (tests point these elsewhere)
+TB="${BATTERY_LIMITS_TB:-/sys/bus/thunderbolt/devices}"
+FLAG="${BATTERY_LIMITS_FLAG:-/run/battery-limits.full}"         # /run: gone at reboot
+
+docks() {   # names of connected Thunderbolt devices, not the laptop's own host routers (N-0)
+    for d in "$TB"/*; do
+        case "${d##*/}" in *-0) continue ;; esac
+        grep -qx 'DEVTYPE=thunderbolt_device' "$d/uevent" 2>/dev/null || continue
+        cat "$d/device_name" 2>/dev/null || echo "${d##*/}"
+    done
+}
+set_limits() {   # set_limits START END - the firmware wants start below end at every moment:
+    for b in "$PS"/BAT*; do   # start, end, start again works from either direction
+        [ -w "$b/charge_control_end_threshold" ] || continue
+        echo "$1" > "$b/charge_control_start_threshold" 2>/dev/null
+        echo "$2" > "$b/charge_control_end_threshold" 2>/dev/null
+        echo "$1" > "$b/charge_control_start_threshold" 2>/dev/null
+    done
+}
+apply() {
+    if [ -n "$(docks)" ] && [ ! -e "$FLAG" ]; then
+        set_limits "$DOCK_START" "$DOCK_END"; what="docked: $DOCK_START-$DOCK_END %"
+    elif [ -e "$FLAG" ]; then
+        set_limits "$AWAY_START" "$AWAY_END"; what="full charge requested: $AWAY_START-$AWAY_END % until undock or reboot"
+    else
+        set_limits "$AWAY_START" "$AWAY_END"; what="not docked: $AWAY_START-$AWAY_END %"
+    fi
+    echo "$what"
+    logger -t battery-limits "$what" 2>/dev/null || true
+}
+need_root() { [ "$(id -u)" = 0 ] || exec sudo -- "$0" "$@"; }
+
+case "${1:-apply}" in
+    apply)  need_root "$@"; apply ;;
+    udev)   # from /etc/udev/rules.d/90-battery-limits.rules: leaving the dock ends a "full" request
+            if [ "${ACTION:-}" = remove ] && [ -z "$(docks)" ]; then rm -f "$FLAG"; fi
+            apply ;;
+    full)   need_root "$@"; : > "$FLAG"; apply ;;
+    normal) need_root "$@"; rm -f "$FLAG"; apply ;;
+    status)
+        d="$(docks | paste -sd, -)"
+        echo "place:   ${d:+docked ($d)}${d:-not docked}"
+        if [ -e "$FLAG" ]; then echo "request: full charge until undock or reboot"; fi
+        for b in "$PS"/BAT*; do
+            [ -r "$b/capacity" ] || continue
+            echo "${b##*/}:    $(cat "$b/status" 2>/dev/null) $(cat "$b/capacity")%, limits" \
+                "$(cat "$b/charge_control_start_threshold" 2>/dev/null)-$(cat "$b/charge_control_end_threshold" 2>/dev/null) %"
+        done ;;
+    *)  echo "usage: battery-limits [apply|full|normal|status]" >&2; exit 2 ;;
+esac

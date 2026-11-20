@@ -1,0 +1,16 @@
+# /etc/zfsbootmenu/config.yaml - deployed by ./deploy; rebuild the image with: sudo update-zbm
+Global:
+  ManageImages: true
+  BootMountPoint: /efi
+  DracutConfDir: /etc/zfsbootmenu/dracut.conf.d
+  PreHooksDir: /etc/zfsbootmenu/generate-zbm.pre.d
+  PostHooksDir: /etc/zfsbootmenu/generate-zbm.post.d
+  InitCPIOConfig: /etc/zfsbootmenu/mkinitcpio.conf
+Components:
+  Enabled: false
+EFI:
+  ImageDir: /efi/EFI/zbm
+  Versions: false
+  Enabled: true
+Kernel:
+  CommandLine: quiet loglevel=0

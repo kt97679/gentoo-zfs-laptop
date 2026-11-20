@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Tribler indicator
+Exec=/usr/local/bin/tribler-tray
+OnlyShowIn=Unity;
+NoDisplay=true

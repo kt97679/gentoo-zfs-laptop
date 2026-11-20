@@ -1,0 +1,3 @@
+# Local ZFS snapshots - policy in /etc/sanoid/sanoid.conf; UTC names as on the Ubuntu laptop
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/15 * * * * root TZ=UTC sanoid --cron --quiet

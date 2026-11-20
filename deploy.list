@@ -1,0 +1,42 @@
+# deploy.list - the system files ./deploy installs from this checkout (root-owned copies).
+# GROUP: base (install-gentoo.sh), desktop (install-unity.sh), tribler (with Podman), brave and
+# eiskaltdcpp (world-update plugins, opt-in); deploy updates the groups it deployed before. Destinations: /etc or
+# /usr/local only. Values that differ per machine (host name, user, key, ESP) stay in the installers.
+# GROUP  MODE  DESTINATION                                                      SOURCE
+base     0755  /usr/local/sbin/world-update                                     files/world-update
+base     0755  /usr/local/sbin/update-zbm                                       files/update-zbm
+base     0644  /etc/dracut.conf.d/zfs.conf                                      files/dracut-zfs.conf
+base     0755  /etc/kernel/postinst.d/90-initramfs-private                     files/initramfs-private
+base     0644  /etc/zfsbootmenu/config.yaml                                     files/zfsbootmenu-config.yaml
+base     0755  /etc/zfsbootmenu/hooks/load-key.d/50-key-injection               files/zbm-key-injection
+base     0755  /etc/zfsbootmenu/hooks/boot-sel.d/90-key-injection               files/zbm-key-injection
+base     0755  /etc/local.d/zram.start                                          files/zram.start
+base     0755  /etc/local.d/zram.stop                                           files/zram.stop
+base     0755  /etc/local.d/battery.start                                       files/battery.start
+base     0755  /usr/local/sbin/battery-limits                                   files/battery-limits
+base     0755  /etc/shadow-maint/useradd-post.d/50-zfs-home                     files/zfs-home
+base     0755  /etc/shadow-maint/userdel-pre.d/50-zfs-home                      files/zfs-home
+base     0755  /etc/shadow-maint/userdel-post.d/50-zfs-home                     files/zfs-home
+base     0644  /etc/udev/rules.d/90-battery-limits.rules                        files/90-battery-limits.rules
+base     0755  /etc/cron.daily/portage-sync                                     files/portage-sync
+base     0644  /etc/sysctl.d/50-arp-one-subnet.conf                             files/50-arp-one-subnet.conf
+base     0644  /etc/ssh/sshd_config.d/10-keys-only.conf                         files/sshd-keys-only.conf
+base     0644  /etc/default/atop                                                files/atop.default
+base     0644  /etc/cron.d/atop                                                 files/atop.cron
+base     0644  /etc/sanoid/sanoid.conf                                          files/sanoid.conf
+base     0644  /etc/cron.d/sanoid-snapshots                                     files/sanoid-snapshots
+base     0440  /etc/sudoers.d/wheel                                             files/sudoers-wheel
+base     0644  /etc/logrotate.d/world-update                                    files/logrotate-world-update
+base     0644  /etc/logrotate.d/emerge                                          files/logrotate-emerge
+desktop  0755  /usr/local/sbin/ehooks-from-source                               files/ehooks-from-source
+desktop  0644  /etc/portage/patches/app-editors/gnome-text-editor/silent-quit.patch  files/gnome-text-editor-silent-quit.patch
+desktop  0755  /usr/local/bin/redock-watch                                      files/redock-watch
+desktop  0644  /etc/xdg/autostart/redock-watch.desktop                          files/redock-watch.desktop
+desktop  0755  /usr/local/sbin/session-memory-limit                             files/session-memory-limit
+desktop  0644  /etc/xdg/autostart/session-memory-limit.desktop                 files/session-memory-limit.desktop
+desktop  0440  /etc/sudoers.d/zz-session-memory-limit                          files/sudoers-session-memory-limit
+tribler  0755  /usr/local/bin/tribler-tray                                      files/tribler-tray
+tribler  0644  /etc/xdg/autostart/tribler-tray.desktop                          files/tribler-tray.desktop
+tribler  0644  /etc/containers/storage.conf                                     files/containers-storage.conf
+brave    0755  /etc/world-update.d/50-brave                                     files/world-update.d/50-brave
+eiskaltdcpp 0755 /etc/world-update.d/60-eiskaltdcpp                            files/world-update.d/60-eiskaltdcpp

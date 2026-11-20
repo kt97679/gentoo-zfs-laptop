@@ -1,0 +1,191 @@
+#!/bin/bash
+# /etc/world-update.d/60-eiskaltdcpp - world-update plugin: EiskaltDC++ from its Qt 6 fork
+# (https://github.com/Delitants/eiskaltdcpp) as net-p2p/eiskaltdcpp in the local repository.
+# Gentoo dropped the original EiskaltDC++ (2025) and Qt 5 (2026). In the "before-update" stage
+# (other stages: nothing to do) it:
+#   1. lists the fork's release tags with `git ls-remote` (no GitHub API, no rate limit): vX.Y.Z,
+#      and with EISKALTDCPP_CHANNEL=pre also vX.Y.Z-pre.N; picks the newest;
+#   2. if that is newer than the local ebuild, or there is none: writes eiskaltdcpp-VERSION.ebuild
+#      (Direct Connect only: no BitTorrent, Lua, spellchecking, QML/JS or daemon) and its Manifest
+#      with `ebuild ... manifest`, which downloads the tag's tarball and records its checksums -
+#      trust on first download, as GitHub tarballs are not signed; the previous ebuild is restored
+#      if anything fails;
+#   3. writes /etc/portage/package.use/eiskaltdcpp (the Qt 6 parts the build needs);
+#   4. adds net-p2p/eiskaltdcpp to @world once, so the world update installs and updates it.
+# Never downgrades: a newest tag older than the local ebuild (e.g. after switching the channel
+# back to releases) keeps the local one. Portage rebuilds it when its libraries change. When this
+# plugin's template changes, the local ebuild is refreshed in place (same version, no rebuild).
+# Settings (optional): /etc/world-update.d/60-eiskaltdcpp.conf, a data file beside the plugin:
+#     EISKALTDCPP_CHANNEL=pre      # release (default) or pre
+# Install: sudo ./deploy --group eiskaltdcpp (from the checkout), then sudo world-update.
+set -Eeuo pipefail
+[ "${1:-}" = before-update ] || exit 0
+
+CONF="${EISKALTDCPP_CONF:-/etc/world-update.d/60-eiskaltdcpp.conf}"   # (the EISKALTDCPP_* paths
+if [ -r "$CONF" ]; then                                                  #  point tests at stand-ins)
+    # shellcheck source=/dev/null
+    . "$CONF"
+fi
+CHANNEL="${EISKALTDCPP_CHANNEL:-release}"
+REPO_URL="${EISKALTDCPP_REPO:-https://github.com/Delitants/eiskaltdcpp}"
+WORLD="${EISKALTDCPP_WORLD:-/var/lib/portage/world}"
+USEFILE="${EISKALTDCPP_USEFILE:-/etc/portage/package.use/eiskaltdcpp}"
+ATOM=net-p2p/eiskaltdcpp
+
+die() { echo "eiskaltdcpp: $*" >&2; exit 1; }
+trap 'echo "eiskaltdcpp: unexpected failure in line $LINENO: $BASH_COMMAND" >&2' ERR
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+ensure_world() {
+    grep -qx "$ATOM" "$WORLD" 2>/dev/null && return 0
+    echo "$ATOM" >> "$WORLD"
+    echo "added $ATOM to @world - this world update installs it"
+}
+pv_of() {   # pv_of TAG: v3.0.0-pre.3 -> 3.0.0_pre3, v2.5.6 -> 2.5.6
+    local t="${1#v}"; echo "${t/-pre./_pre}"
+}
+tag_of() {  # tag_of PV: 3.0.0_pre3 -> v3.0.0-pre.3 (the inverse of pv_of)
+    echo "v${1/_pre/-pre.}"
+}
+key_of() {  # key_of PV: a key `sort -V` orders like Portage: 3.0.0_pre3 -> 3.0.0.0.3 < 3.0.0 -> 3.0.0.1.0
+    if [[ "$1" == *_pre* ]]; then echo "${1%_pre*}.0.${1##*_pre}"; else echo "$1.1.0"; fi
+}
+newer() {   # newer A B: true if version A is newer than B
+    [ "$1" != "$2" ] && [ "$(printf '%s\n' "$(key_of "$1")" "$(key_of "$2")" | sort -V | tail -n1)" = "$(key_of "$1")" ]
+}
+case "$CHANNEL" in
+    release) pattern='^v[0-9]+\.[0-9]+\.[0-9]+$' ;;
+    pre)     pattern='^v[0-9]+\.[0-9]+\.[0-9]+(-pre\.[0-9]+)?$' ;;
+    *) die "EISKALTDCPP_CHANNEL must be release or pre, not '$CHANNEL'" ;;
+esac
+
+# 1. The newest tag in the channel.
+git ls-remote --tags --refs "$REPO_URL" > "$tmp/tags" 2>"$tmp/git.err" \
+    || die "cannot list the fork's tags at $REPO_URL: $(tail -n1 "$tmp/git.err")"
+tag=""; pv=""
+while read -r _ ref; do
+    t="${ref#refs/tags/}"
+    [[ "$t" =~ $pattern ]] || continue
+    if [ -z "$pv" ] || newer "$(pv_of "$t")" "$pv"; then tag="$t"; pv="$(pv_of "$t")"; fi
+done < "$tmp/tags"
+[ -n "$tag" ] || die "no $CHANNEL tag found at $REPO_URL"
+
+# 2. The local repository and the ebuild.
+repo="$(portageq get_repo_path / local 2>/dev/null || true)"
+if [ -z "$repo" ]; then
+    repo=/var/db/repos/local
+    mkdir -p "$repo/metadata" "$repo/profiles" /etc/portage/repos.conf
+    echo local > "$repo/profiles/repo_name"
+    printf '%s\n' 'masters = gentoo' 'thin-manifests = true' > "$repo/metadata/layout.conf"
+    printf '%s\n' '[local]' "location = $repo" > /etc/portage/repos.conf/local.conf
+    echo "created the local repository $repo"
+fi
+pkgdir="$repo/$ATOM"
+current=""
+for e in "$pkgdir"/eiskaltdcpp-*.ebuild; do
+    [ -e "$e" ] || continue
+    v="${e##*/eiskaltdcpp-}"; v="${v%.ebuild}"
+    if [ -z "$current" ] || newer "$v" "$current"; then current="$v"; fi
+done
+
+# 3. The Qt 6 parts the build needs (Portage would otherwise stop the whole world update).
+printf '%s\n' '# written by /etc/world-update.d/60-eiskaltdcpp' \
+    'dev-qt/qtbase concurrent dbus gui network sql sqlite widgets xml X' \
+    'dev-qt/qttools linguist' > "$tmp/use"
+mkdir -p "${USEFILE%/*}"
+cmp -s "$tmp/use" "$USEFILE" 2>/dev/null || { cp "$tmp/use" "$USEFILE"; echo "wrote $USEFILE"; }
+
+if [ -n "$current" ] && newer "$current" "$pv"; then
+    echo "eiskaltdcpp: the newest $CHANNEL tag is $tag, older than the local $current - keeping $current"
+    pv="$current"; tag="$(tag_of "$current")"
+fi
+sed "s/@TAG@/$tag/" > "$tmp/ebuild" <<'EBUILD_EOF'
+# Written by /etc/world-update.d/60-eiskaltdcpp - do not edit: the next world-update may replace it.
+EAPI=8
+inherit cmake xdg
+
+MY_TAG="@TAG@"
+DESCRIPTION="Direct Connect and ADC client - the Qt 6 fork of EiskaltDC++"
+HOMEPAGE="https://github.com/Delitants/eiskaltdcpp"
+SRC_URI="https://github.com/Delitants/eiskaltdcpp/archive/refs/tags/${MY_TAG}.tar.gz -> ${P}.tar.gz"
+S="${WORKDIR}/eiskaltdcpp-${MY_TAG#v}"
+
+LICENSE="GPL-3+"
+SLOT="0"
+KEYWORDS="amd64"
+RESTRICT="test"
+
+RDEPEND="
+	app-arch/bzip2
+	dev-libs/libpcre2:=
+	dev-libs/openssl:=
+	dev-qt/qtbase:6[concurrent,dbus,gui,network,sql,sqlite,widgets,xml,X]
+	dev-qt/qtsvg:6
+	net-dns/c-ares:=
+	net-dns/libidn2:=
+	net-libs/miniupnpc:=
+	sys-apps/attr
+	sys-libs/zlib
+	virtual/libiconv
+"
+DEPEND="${RDEPEND}"
+BDEPEND="
+	dev-qt/qttools:6[linguist]
+	sys-devel/gettext
+	virtual/pkgconfig
+"
+
+src_prepare() {
+	# 3.x links a static c-ares into its shared core when both kinds are installed (2.5.x has no
+	# such file)
+	if [[ -f cmake/ProxyResolver.cmake ]]; then
+		sed -i 's/^if(TARGET c-ares::cares_static)/if(FALSE)/' cmake/ProxyResolver.cmake || die
+	fi
+	# CMake 4 refuses minimums below 3.5; the fork missed this one file (upstream: 87a87980)
+	if [[ -f eiskaltdcpp-cli/CMakeLists.txt ]]; then
+		sed -i 's/cmake_minimum_required(VERSION 3\.2\.0)/cmake_minimum_required(VERSION 3.5)/' \
+			eiskaltdcpp-cli/CMakeLists.txt || die
+	fi
+	# The fork prints connection traces to stderr unconditionally (fprintf(stderr, "[CM::... and
+	# "[NmdcHub::..., 29 calls); in a desktop session they fill ~/.xsession-errors. Each becomes a
+	# no-op macro: all are standalone statements whose arguments have no side effects.
+	local f
+	for f in dcpp/ConnectionManager.cpp dcpp/NmdcHub.cpp; do
+		[[ -f ${f} ]] || continue
+		sed -i -e '1i #define EK_TRACE(...) ((void)0)' \
+			-e 's/fprintf(stderr, "\[\(CM\|NmdcHub\)::/EK_TRACE(stderr, "[\1::/' "${f}" || die
+		! grep -q 'fprintf(stderr, "\[\(CM\|NmdcHub\)::' "${f}" || die "connection traces left in ${f}"
+	done
+	cmake_src_prepare
+}
+
+src_configure() {
+	local mycmakeargs=(
+		-DUSE_QT6=ON -DUSE_GTK3=OFF -DUSE_TORRENT=OFF -DBUILD_TESTS=OFF
+		-DUSE_ASPELL=OFF -DLUA_SCRIPT=OFF -DWITH_LUASCRIPTS=OFF -DUSE_JS=OFF -DUSE_QT_QML=OFF
+		-DNO_UI_DAEMON=OFF -DJSONRPC_DAEMON=OFF -DUSE_CCACHE=OFF -DCOMPRESS_MANPAGES=OFF
+	)
+	cmake_src_configure
+}
+EBUILD_EOF
+new="$pkgdir/eiskaltdcpp-$pv.ebuild"
+if [ "$current" = "$pv" ] && cmp -s "$tmp/ebuild" "$new"; then
+    echo "eiskaltdcpp $pv ($CHANNEL) is current"
+    ensure_world; exit 0
+fi
+if [ "$current" = "$pv" ]; then
+    what="refreshing $new (this plugin's template changed; used from its next build)"
+else
+    what="writing $new and its Manifest (downloads the source)"
+fi
+mkdir -p "$pkgdir"; cp -a "$pkgdir" "$tmp/previous"
+restore() { rm -rf "$pkgdir"; cp -a "$tmp/previous" "$pkgdir"; }
+rm -f "$pkgdir"/eiskaltdcpp-*.ebuild "$pkgdir/Manifest"
+cp "$tmp/ebuild" "$new"
+echo "eiskaltdcpp $tag: $what"
+if ! ebuild "$new" manifest > "$tmp/manifest.log" 2>&1; then
+    tail -n 5 "$tmp/manifest.log" >&2
+    restore; die "could not write the Manifest - the previous ebuild is back"
+fi
+grep -q "^DIST eiskaltdcpp-$pv.tar.gz " "$pkgdir/Manifest" 2>/dev/null \
+    || { restore; die "the Manifest does not list eiskaltdcpp-$pv.tar.gz - the previous ebuild is back"; }
+ensure_world

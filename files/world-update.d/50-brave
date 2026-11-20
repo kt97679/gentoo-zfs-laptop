@@ -1,0 +1,262 @@
+#!/bin/bash
+# /etc/world-update.d/50-brave - world-update plugin: keeps the Brave browser
+# (www-client/brave-bin) current from Brave's own signed APT repository, with no third-party
+# overlay. In the "before-update" stage (other stages: nothing to do) it:
+#   1. checks the repository's InRelease against a pinned keyring beside this plugin
+#      (brave-archive-keyring.gpg). On the first run it is fetched from Brave, its fingerprints are
+#      shown, and you confirm them against https://brave.com/signing-keys/ before it is saved;
+#   2. checks the amd64 package index against the signed Release and picks the newest
+#      brave-browser;
+#   3. if that is newer than the ebuild in the local repository (created as
+#      /var/db/repos/local if there is none): downloads the .deb, checks its size and SHA256
+#      against the signed index, puts it in DISTDIR, and writes brave-bin-VERSION.ebuild and its
+#      Manifest from that verified file (the previous ebuild is restored if anything fails);
+#   4. adds www-client/brave-bin to @world once, so the world update installs and updates it.
+# A repository version older than the local ebuild is refused (exit 2): never downgrade silently.
+# Install: sudo install -D -m 755 50-brave /etc/world-update.d/50-brave
+set -Eeuo pipefail
+[ "${1:-}" = before-update ] || exit 0
+REPO_URL="${BRAVE_REPO_URL:-https://brave-browser-apt-release.s3.brave.com}"   # (tests point these
+KEYRING="${BRAVE_KEYRING:-/etc/world-update.d/brave-archive-keyring.gpg}"     #  at a stand-in)
+ATOM=www-client/brave-bin
+WORLD=/var/lib/portage/world
+
+die() { echo "brave: $*" >&2; exit 1; }
+trap 'echo "brave: unexpected failure in line $LINENO: $BASH_COMMAND" >&2' ERR
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+export GNUPGHOME="$tmp/gnupg"; mkdir -m 700 "$GNUPGHOME"
+fetch() { wget -q -O "$2" "$REPO_URL/$1" || die "could not download $REPO_URL/$1"; }
+matches() {   # matches FILE SHA256 SIZE
+    [ "$(stat -c %s "$1")" = "$3" ] && [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$2" ]
+}
+ensure_world() {
+    grep -qx "$ATOM" "$WORLD" 2>/dev/null && return 0
+    echo "$ATOM" >> "$WORLD"
+    echo "added $ATOM to @world - this world update installs it"
+}
+
+# 1. The keyring: fetched and confirmed once, then only the saved copy is used.
+if [ ! -s "$KEYRING" ]; then
+    fetch brave-browser-archive-keyring.gpg "$tmp/keyring"
+    if grep -q -- '-----BEGIN PGP' "$tmp/keyring"; then   # gpgv wants the binary form
+        gpg --batch --yes --dearmor -o "$tmp/keyring.bin" "$tmp/keyring" && mv "$tmp/keyring.bin" "$tmp/keyring"
+    fi
+    echo "Brave's repository keyring, just downloaded from $REPO_URL:"
+    gpg --batch --show-keys --with-subkey-fingerprint --keyid-format long "$tmp/keyring" 2>/dev/null \
+        | sed 's/^/    /'
+    echo "Compare these fingerprints with https://brave.com/signing-keys/ before trusting them."
+    read -rp "Trust this keyring for Brave updates? [y/N] " a || a=""
+    [[ "$a" == [yY]* ]] || die "keyring not trusted - nothing changed"
+    install -D -m 0644 "$tmp/keyring" "$KEYRING"
+    echo "saved as $KEYRING - later runs use only this file"
+fi
+
+# 2. The signed Release, then the package index it vouches for.
+fetch dists/stable/InRelease "$tmp/InRelease"
+# --output - (stdout), not a file: gpgv 2.5 writes --output FILE to FILE.part and never renames it
+gpgv --keyring "$KEYRING" --output - "$tmp/InRelease" > "$tmp/Release" 2> "$tmp/gpgv.log" || {
+    sed 's/^/    /' "$tmp/gpgv.log" >&2
+    die "the repository's signature does not verify with $KEYRING. If Brave changed its key, check
+       https://brave.com/signing-keys/, remove $KEYRING and run world-update again."
+}
+[ -s "$tmp/Release" ] || die "gpgv accepted the signature but gave no signed text"
+entry="" name=""
+for name in Packages Packages.gz Packages.xz; do   # only the verified Release is read from here on
+    entry="$(awk -v want="main/binary-amd64/$name" '/^SHA256:/ {s = 1; next} /^[^ ]/ {s = 0}
+        s && $3 == want {print $1, $2; exit}' "$tmp/Release")"
+    [ -z "$entry" ] || break
+done
+[ -n "$entry" ] || die "the signed Release lists no amd64 package index"
+fetch "dists/stable/main/binary-amd64/$name" "$tmp/$name"
+matches "$tmp/$name" "${entry% *}" "${entry#* }" || die "the package index does not match the signed Release"
+case "$name" in
+    *.gz) gzip -dc "$tmp/$name" > "$tmp/Packages.txt" ;;
+    *.xz) xz -dc "$tmp/$name" > "$tmp/Packages.txt" ;;
+    *)    cp "$tmp/$name" "$tmp/Packages.txt" ;;
+esac
+best="$(awk '
+    function emit() { if (p == "brave-browser" && a == "amd64") print v, f, s, h; p = v = a = f = s = h = "" }
+    /^Package: /      {p = $2}
+    /^Version: /      {v = $2}
+    /^Architecture: / {a = $2}
+    /^Filename: /     {f = $2}
+    /^Size: /         {s = $2}
+    /^SHA256: /       {h = $2}
+    /^$/              {emit()}
+    END               {emit()}' "$tmp/Packages.txt" | sort -V -k1,1 | tail -n1)"
+[ -n "$best" ] || die "the package index has no brave-browser for amd64"
+read -r ver file dsize dsum <<<"$best"
+pv="${ver#*:}"; pv="${pv%%-*}"   # Debian epoch and revision off: Gentoo's version
+[[ "$pv" =~ ^[0-9]+(\.[0-9]+)+$ ]] || die "unexpected version '$ver' in the index"
+[[ "$file" =~ ^pool/[A-Za-z0-9._+/-]+\.deb$ && "$file" != *..* ]] || die "unexpected file name '$file'"
+[[ "$dsize" =~ ^[0-9]+$ && "$dsum" =~ ^[0-9a-f]{64}$ ]] || die "unexpected size or checksum for $file"
+
+# 3. The local repository and the ebuild.
+repo="$(portageq get_repo_path / local 2>/dev/null || true)"
+if [ -z "$repo" ]; then
+    repo=/var/db/repos/local
+    mkdir -p "$repo/metadata" "$repo/profiles" /etc/portage/repos.conf
+    echo local > "$repo/profiles/repo_name"
+    printf '%s\n' 'masters = gentoo' 'thin-manifests = true' > "$repo/metadata/layout.conf"
+    printf '%s\n' '[local]' "location = $repo" > /etc/portage/repos.conf/local.conf
+    echo "created the local repository $repo"
+fi
+pkgdir="$repo/$ATOM"
+current="$(for e in "$pkgdir"/brave-bin-*.ebuild; do
+    if [ -e "$e" ]; then e="${e##*/brave-bin-}"; echo "${e%.ebuild}"; fi; done | sort -V | tail -n1)"
+if [ "$current" = "$pv" ]; then
+    echo "brave-bin $pv is current"
+    ensure_world; exit 0
+fi
+if [ -n "$current" ] && [ "$(printf '%s\n' "$current" "$pv" | sort -V | tail -n1)" != "$pv" ]; then
+    echo "brave: the repository offers $pv, older than the local ebuild $current - keeping $current" >&2
+    exit 2
+fi
+
+distdir="$(portageq distdir)"
+dist="brave-browser_${pv}_amd64.deb"
+echo "brave-browser $ver: downloading $((dsize / 1048576)) MiB"
+fetch "$file" "$tmp/$dist"
+matches "$tmp/$dist" "$dsum" "$dsize" || die "$file does not match the signed index - not used"
+install -m 0664 "$tmp/$dist" "$distdir/$dist"
+chown portage:portage "$distdir/$dist" 2>/dev/null || true
+
+mkdir -p "$pkgdir"; cp -a "$pkgdir" "$tmp/previous"
+restore() { rm -rf "$pkgdir"; cp -a "$tmp/previous" "$pkgdir"; }
+rm -f "$pkgdir"/brave-bin-*.ebuild "$pkgdir/Manifest"
+new="$pkgdir/brave-bin-$pv.ebuild"
+cat > "$new" <<'EBUILD_EOF'
+# Written by /etc/world-update.d/50-brave from Brave's signed APT repository - do not edit:
+# the next world-update replaces it. Modelled on Gentoo's www-client/google-chrome.
+EAPI=8
+
+CHROMIUM_LANGS="af am ar az bg bn bs ca cs da de el en-GB es es-419 et fa fi fil fr gu he
+	hi hr hu id it ja ka kk km kn ko lo lt lv mk ml mn mr ms my nb nl pl pt-BR pt-PT ro ru si sk
+	sl sq sr sr-Latn sv sw ta te th tr uk ur uz vi zh-CN zh-TW"
+
+inherit chromium-2 desktop pax-utils unpacker xdg
+
+DESCRIPTION="Brave web browser (binary package from Brave's APT repository)"
+HOMEPAGE="https://brave.com/"
+SRC_URI="@URL@ -> brave-browser_${PV}_amd64.deb"
+S=${WORKDIR}
+
+LICENSE="MPL-2.0 BSD"
+SLOT="0"
+KEYWORDS="-* amd64"
+IUSE="qt6"
+RESTRICT="bindist mirror strip"
+
+RDEPEND="
+	>=app-accessibility/at-spi2-core-2.46.0:2
+	app-misc/ca-certificates
+	dev-libs/expat
+	dev-libs/glib:2
+	dev-libs/nspr
+	>=dev-libs/nss-3.26
+	media-fonts/liberation-fonts
+	media-libs/alsa-lib
+	media-libs/mesa[gbm(+)]
+	net-misc/curl
+	net-print/cups
+	sys-apps/dbus
+	sys-libs/glibc
+	sys-libs/libcap
+	x11-libs/cairo
+	x11-libs/gdk-pixbuf:2
+	|| (
+		x11-libs/gtk+:3[X]
+		gui-libs/gtk:4[X]
+	)
+	x11-libs/libdrm
+	>=x11-libs/libX11-1.5.0
+	x11-libs/libXcomposite
+	x11-libs/libXdamage
+	x11-libs/libXext
+	x11-libs/libXfixes
+	x11-libs/libXrandr
+	x11-libs/libxcb
+	x11-libs/libxkbcommon
+	x11-libs/libxshmfence
+	x11-libs/pango
+	x11-misc/xdg-utils
+	qt6? ( dev-qt/qtbase:6[gui,widgets] )
+"
+
+QA_PREBUILT="*"
+BRAVE_HOME="opt/brave.com/brave"
+
+pkg_pretend() {
+	use amd64 || die "${PN} only works on amd64"
+}
+
+pkg_setup() {
+	chromium_suid_sandbox_check_kernel_config
+}
+
+src_unpack() {
+	:
+}
+
+src_install() {
+	dodir /
+	cd "${ED}" || die
+	unpacker
+
+	# apt's cron job and repository files have no use on Gentoo
+	rm -rf etc/cron.daily etc/apt "${BRAVE_HOME}"/cron || die
+
+	# the documentation under Gentoo's name (Brave has used both directory names)
+	local d
+	for d in brave-browser brave-browser-stable; do
+		if [[ -d usr/share/doc/${d} ]]; then
+			mkdir -p "usr/share/doc/${PF}" || die
+			cp -a "usr/share/doc/${d}/." "usr/share/doc/${PF}/" || die
+			rm -rf "usr/share/doc/${d}" || die
+		fi
+	done
+	# AppStream metadata belongs in metainfo; appdata is deprecated
+	if [[ -d usr/share/appdata ]]; then
+		mkdir -p usr/share/metainfo || die
+		cp -a usr/share/appdata/. usr/share/metainfo/ || die
+		rm -rf usr/share/appdata || die
+	fi
+	# Portage compresses documentation itself; links to compressed pages would dangle
+	if [[ -d usr/share ]]; then
+		find usr/share/doc usr/share/man -name '*.gz' -type f -exec gzip -d {} + 2>/dev/null
+		find usr/share/doc usr/share/man -xtype l -delete 2>/dev/null
+	fi
+
+	pushd "${BRAVE_HOME}/locales" > /dev/null || die
+	chromium_remove_language_paks
+	popd > /dev/null || die
+
+	rm -f "${BRAVE_HOME}/libqt5_shim.so" || die
+	if ! use qt6; then
+		rm -f "${BRAVE_HOME}/libqt6_shim.so" || die
+	fi
+
+	if [[ ! -e usr/bin/brave-browser && -e usr/bin/brave-browser-stable ]]; then
+		dosym brave-browser-stable /usr/bin/brave-browser
+	fi
+
+	local size
+	for size in 16 22 24 32 48 64 128 256; do
+		if [[ -f ${BRAVE_HOME}/product_logo_${size}.png ]]; then
+			newicon -s ${size} "${BRAVE_HOME}/product_logo_${size}.png" brave-browser.png
+		fi
+	done
+
+	pax-mark m "${BRAVE_HOME}/brave"
+}
+EBUILD_EOF
+url="$REPO_URL/$file"
+text="$(cat "$new")"; printf '%s\n' "${text/@URL@/"$url"}" > "$new"   # quoted: no & expansion
+if ! ebuild "$new" manifest; then
+    restore; die "could not write the Manifest - the previous ebuild is back"
+fi
+if ! grep -q "^DIST $dist $dsize " "$pkgdir/Manifest"; then
+    restore; die "the Manifest does not list $dist with the signed size - the previous ebuild is back"
+fi
+echo "wrote $new (was: ${current:-none})"
+ensure_world

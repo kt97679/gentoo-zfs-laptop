@@ -1,0 +1,11 @@
+#!/bin/sh
+# Sync the Gentoo tree and all overlays once a day (rsync, verified by Gentoo's signed
+# MetaManifest). Waits up to 5 minutes for the network, e.g. right after waking up. cronie's anacron
+# runs /etc/cron.daily once a day whenever the laptop is on (a fixed time would be missed asleep).
+# The last run's output is in /var/log/portage-sync.log.
+LOG=/var/log/portage-sync.log
+if ! nm-online -q -t 300; then
+    echo "$(date -Is) no network - sync skipped" > "$LOG"
+    exit 0
+fi
+{ echo "== $(date -Is)"; emerge --sync --quiet; echo "== exit status $?"; } > "$LOG" 2>&1

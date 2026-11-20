@@ -1,0 +1,22 @@
+# /etc/logrotate.d/world-update - rotation for world-update's log (deployed by ./deploy, group
+# base). world-update appends every run to the log (tee -a) - a few MB a run, mostly merge
+# listings, since its builds are quiet (one loud webkit-gtk build made 106 MB) - and nothing else
+# trims it. logrotate runs once a day from
+# /etc/cron.daily/logrotate (app-admin/logrotate, USE cron; anacron catches up after sleep).
+# - monthly (logrotate: the first daily run in a new calendar month), and sooner once it
+#   passes 20 MB (checked at every daily run);
+# - 6 old logs kept, compressed - except the newest (delaycompress): a run going on while
+#   logrotate renames the file keeps writing into the renamed file, which must not be
+#   compressed under it, and the last finished runs stay readable with grep;
+# - nocreate: world-update starts a new log itself (tee -a), so logrotate makes no empty one.
+# The rest (dated names, compress, notifempty) comes from Gentoo's /etc/logrotate.conf.
+/var/log/world-update.log {
+    monthly
+    maxsize 20M
+    rotate 6
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+}

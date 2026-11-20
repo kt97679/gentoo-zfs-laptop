@@ -1,0 +1,45 @@
+#!/bin/bash
+# session-memory-limit - a soft memory cap on the calling desktop session: the cgroup v2 equivalent
+# of MemoryHigh= on systemd's app.slice (e.g. MemoryHigh=20G there on a 32 GB laptop). Run at
+# login by /etc/xdg/autostart/session-memory-limit.desktop through sudo; /etc/sudoers.d/
+# zz-session-memory-limit lets every user run exactly this, without arguments (deployed by ./deploy,
+# group desktop). It writes memory.high of the cgroup elogind made for the login session
+# (/sys/fs/cgroup/<session id>): above it the kernel reclaims the session's memory - into
+# compressed swap - and slows it, so a browser cannot crowd out the rest; nothing is killed.
+# Only the caller's own session: elogind must name the cgroup's session as the sudo caller's.
+# Size: 5/8 of RAM (32 GB: 20 GiB; 64 GB: 36 GiB). A fixed size
+# instead, e.g. MEMORY_HIGH=24G, in /etc/session-memory-limit.conf ("max": no cap), from the next
+# login. See it: cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.high
+# What it did, or why it refused, goes to the system log as well as stderr:
+#     grep session-memory-limit /var/log/messages
+set -euo pipefail
+# overrides for tools/test-session-memory-limit.sh only - sudo clears the environment
+CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}" SELF_CGROUP="${SELF_CGROUP:-/proc/self/cgroup}"
+CONF="${CONF:-/etc/session-memory-limit.conf}" MEMINFO="${MEMINFO:-/proc/meminfo}"
+say() {     # say PRIORITY TEXT: to stderr and to the system log (user facility)
+    echo "session-memory-limit: $2" >&2
+    logger -t session-memory-limit -p "user.$1" -- "$2" 2>/dev/null || true
+}
+die() { say warning "$*"; exit 1; }
+[ "$(id -u)" = 0 ] || die "needs root - it runs through sudo at login"
+uid="${SUDO_UID:-}"
+[[ "$uid" =~ ^[0-9]+$ ]] || die "run it through sudo (no SUDO_UID: whose session?)"
+
+if [ -r "$CONF" ] && grep -q '^MEMORY_HIGH=' "$CONF"; then
+    high="$(grep '^MEMORY_HIGH=' "$CONF" | tail -n1 | cut -d= -f2- | tr -d '[:space:]"')"
+    [[ "$high" =~ ^([0-9]+[KMGT]?|max)$ ]] || die "MEMORY_HIGH=$high in $CONF: not a size (like 24G) or max"
+else
+    kb="$(awk '/^MemTotal:/ {print $2}' "$MEMINFO")"
+    [[ "$kb" =~ ^[0-9]+$ ]] || die "no MemTotal in $MEMINFO"
+    high="$(( kb * 5 / 8 / 1024 ))M"
+fi
+
+cg="$(sed -n 's/^0:://p' "$SELF_CGROUP")"
+[[ "$cg" =~ ^/([A-Za-z0-9]+)$ ]] || die "not in a login session's cgroup (${cg:-none})"
+id="${BASH_REMATCH[1]}"
+owner="$(loginctl show-session "$id" -p User 2>/dev/null | sed -n 's/^User=//p')" || owner=""
+[ "$owner" = "$uid" ] || die "cgroup $cg is not a session of uid $uid (elogind says: ${owner:-no such session})"
+f="$CGROUP_ROOT$cg/memory.high"
+[ -f "$f" ] || die "$f is missing (memory controller not enabled for sessions?)"
+echo "$high" > "$f"
+say notice "session $id (uid $uid): memory.high $(cat "$f")"

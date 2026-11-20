@@ -1,0 +1,185 @@
+#!/bin/bash
+# redock-watch - put windows back where they were when you re-dock. Event-driven, no polling,
+# no Python: only X tools (xev, xrandr, wmctrl, xprop).
+#
+# How it works
+#   It listens to X events on the root window (via xev):
+#   * windows opened/closed/moved/resized: once things are calm for QUIET seconds, it takes
+#     a snapshot of all windows: id, position, size and whether maximized.
+#   * monitor layout changed (RandR), SETTLE seconds after the last monitor event:
+#     - UNDOCK (monitors removed): windows that were on a vanished monitor (according to the
+#       last snapshot) are remembered as "displaced". Any that are now off-screen are moved
+#       onto the first monitor at the same relative position (Compiz itself only moves
+#       maximized windows).
+#     - RE-DOCK (monitors added, same layout as before the undock): only the displaced
+#       windows go back to their exact docked position and size, maximized again if they
+#       were. Windows on the laptop, and windows opened while undocked, are left alone.
+# Windows are identified by their X window id (e.g. 0x03a00003): unique, and constant for
+# as long as the window exists.
+#
+# Log: off unless the log file exists (checked at every event - no restart needed). To look into
+# a problem, turn it on, reproduce, read it:
+#     mkdir -p ~/.local/state/redock-watch && touch ~/.local/state/redock-watch/redock-watch.log
+#     ... and off again: rm -r ~/.local/state/redock-watch
+# It records monitors and windows - titles included - around every change, so it is kept private
+# (folder 700, file 600), and past LOG_MAX bytes it moves to redock-watch.log.old (one old copy).
+# The script's own errors go to stderr: the desktop session's log (~/.xsession-errors).
+LOGD="${XDG_STATE_HOME:-$HOME/.local/state}/redock-watch"
+LOGF="$LOGD/redock-watch.log"
+LOG_MAX=1048576
+QUIET=1        # seconds of calm before taking a window snapshot
+SETTLE=1       # seconds after the last monitor event before acting (try 0.5-2)
+logging() {     # is the log on? if so: private modes, and a log past LOG_MAX moved aside
+    [ -f "$LOGF" ] || return 1
+    chmod 700 "$LOGD" 2>/dev/null; chmod 600 "$LOGF" 2>/dev/null
+    local size
+    size="$(stat -c %s "$LOGF" 2>/dev/null)" || size=0
+    # moved aside past LOG_MAX: the caller's write starts the new file (the folder is 700 already,
+    # the next check makes the file 600), so the log stays on
+    if [ "$size" -gt "$LOG_MAX" ]; then mv -f "$LOGF" "$LOGF.old"; fi
+    return 0
+}
+log() { logging || return 0; echo "$(date -Is) $*" >> "$LOGF"; }
+for tool in xev xrandr wmctrl xprop; do
+    command -v "$tool" >/dev/null || { log "$tool not found"; exit 1; }
+done
+
+usec() { local t="${EPOCHREALTIME/[.,]/}"; echo "$t"; }       # current time in microseconds
+settle_us=$(awk -v s="$SETTLE" 'BEGIN { printf "%d", s * 1000000 }')
+
+monitor_geoms() {      # one "W H X Y" line per monitor, in a stable order
+    xrandr --listmonitors 2>/dev/null | awk 'NR > 1 {
+        g = $3; gsub(/\/[0-9]+/, "", g); split(g, a, /[x+]/); print a[1], a[2], a[3], a[4] }' | sort
+}
+windows() {            # "id x y w h maximized" for application windows only
+    # Skips helper windows (Unity's launcher, panel, dash, HUD, drag-and-drop window, the
+    # desktop icons window): they are not NORMAL/DIALOG windows or are hidden from the taskbar.
+    wmctrl -lG 2>/dev/null | while read -r id desk x y w h _; do
+        [ "$desk" = "-1" ] && continue
+        type="$(xprop -id "$id" _NET_WM_WINDOW_TYPE 2>/dev/null)"
+        case "$type" in *_NORMAL*|*_DIALOG*|*"not found"*) ;; *) continue ;; esac
+        state="$(xprop -id "$id" _NET_WM_STATE 2>/dev/null)"
+        case "$state" in *SKIP_TASKBAR*) continue ;; esac
+        max=0
+        case "$state" in *MAXIMIZED_HORZ*) case "$state" in *MAXIMIZED_VERT*) max=1 ;; esac ;; esac
+        echo "$id $x $y $w $h $max"
+    done
+}
+# shellcheck disable=SC2016  # awk programs below use awk fields ($1..), not shell variables
+ON_MONITOR='{ if (cx >= $3 && cx < $3 + $1 && cy >= $4 && cy < $4 + $2) { print; exit } }'
+monitor_of() { awk -v cx="$1" -v cy="$2" "$ON_MONITOR" <<<"$3"; }   # cx cy geoms
+log_state() {   # (skipped when the log is off: it queries every window)
+    logging || return 0
+    { echo "--- $1"
+      monitor_geoms | sed 's/^/monitor W H X Y: /'
+      wmctrl -lGx 2>/dev/null | sed 's/^/window id desk X Y W H class host title: /'
+    } >> "$LOGF"
+}
+single_viewport() {    # with Compiz viewports, windows on other workspaces look off-screen
+    local dg sw
+    dg="$(wmctrl -d 2>/dev/null | awk '$2 == "*" {print $4; exit}')"
+    sw="$(xrandr 2>/dev/null | awk '/current/ {gsub(",", "", $10); print $8 "x" $10; exit}')"
+    [ "$dg" = "$sw" ]
+}
+
+undock() {             # $1 geoms before, $2 geoms now, $3 last snapshot; prints displaced list
+    local before="$1" now="$2" snap="$3" tw th tx ty
+    read -r tw th tx ty <<<"$(head -n1 <<<"$now")"
+    while read -r id x y w h max; do
+        [ -n "$id" ] || continue
+        cx=$(( x + w / 2 )); cy=$(( y + h / 2 ))
+        old="$(monitor_of "$cx" "$cy" "$before")"
+        [ -n "$old" ] || continue                                      # was on no monitor at all
+        [ -n "$(monitor_of "$cx" "$cy" "$now")" ] && continue          # its monitor is still there
+        echo "$id $x $y $w $h $max"                                    # displaced
+        cur="$(wmctrl -lG 2>/dev/null | awk -v id="$id" '$1 == id {print $3, $4, $5, $6; exit}')"
+        [ -n "$cur" ] || continue                                      # window closed meanwhile
+        read -r x2 y2 w2 h2 <<<"$cur"
+        ccx=$(( x2 + w2 / 2 )); ccy=$(( y2 + h2 / 2 ))
+        [ -n "$(monitor_of "$ccx" "$ccy" "$now")" ] && continue        # Compiz already moved it
+        read -r ow oh ox oy <<<"$old"
+        nx=$(( tx + (cx - ox) * tw / ow - w2 / 2 )); ny=$(( ty + (cy - oy) * th / oh - h2 / 2 ))
+        [ "$nx" -gt $(( tx + tw - w2 )) ] && nx=$(( tx + tw - w2 ))
+        [ "$ny" -gt $(( ty + th - h2 )) ] && ny=$(( ty + th - h2 ))
+        [ "$nx" -lt "$tx" ] && nx=$tx
+        [ "$ny" -lt "$ty" ] && ny=$ty
+        log "moving off-screen $id from $x2,$y2 to $nx,$ny"
+        wmctrl -i -r "$id" -e "10,$nx,$ny,-1,-1"                       # 10 = static gravity: exact
+    done <<<"$snap"
+}
+redock() {             # $1 displaced list: put those windows back exactly
+    while read -r id x y w h max; do
+        [ -n "$id" ] || continue
+        wmctrl -lG 2>/dev/null | awk -v id="$id" '$1 == id {f=1} END {exit !f}' \
+            || { log "window $id is gone, skipping"; continue; }
+        log "restoring $id to $x,$y ${w}x$h maximized=$max"
+        wmctrl -i -r "$id" -b remove,maximized_vert,maximized_horz
+        wmctrl -i -r "$id" -e "10,$x,$y,$w,$h"
+        [ "$max" = 1 ] && wmctrl -i -r "$id" -b add,maximized_vert,maximized_horz
+    done <<<"$1"
+}
+
+windows_changed=1      # take a first snapshot right away
+monitors_changed=0
+deadline=0
+snapshot=""
+displaced=""
+displaced_geoms=""
+geoms_before="$(monitor_geoms)"
+log "started, $(wc -l <<<"$geoms_before") monitor(s)"
+xev -root -event substructure -event randr 2>/dev/null | while :; do
+    timeout="$QUIET"
+    if [ "$monitors_changed" = 1 ]; then
+        left=$(( deadline - $(usec) ))
+        if [ "$left" -le 0 ]; then
+            geoms_now="$(monitor_geoms)"
+            n_before="$(wc -l <<<"$geoms_before")"; n_now="$(wc -l <<<"$geoms_now")"
+            log_state "monitors $n_before -> $n_now, before acting"
+            if logging; then
+                { echo "--- last snapshot (tracked windows: id x y w h maximized)"; echo "$snapshot"; } >> "$LOGF"
+            fi
+            if [ "$n_now" -lt "$n_before" ]; then
+                if single_viewport; then
+                    displaced="$(undock "$geoms_before" "$geoms_now" "$snapshot")"
+                    displaced_geoms="$geoms_before"
+                    log "undock: $(grep -c . <<<"$displaced") displaced window(s) remembered"
+                else
+                    log "undock: several workspaces/viewports in use - not moving windows"
+                fi
+            elif [ "$n_now" -gt "$n_before" ]; then
+                if [ -n "$displaced" ] && [ "$geoms_now" = "$displaced_geoms" ]; then
+                    log "re-dock: restoring displaced windows"
+                    redock "$displaced"
+                elif [ -n "$displaced" ]; then
+                    log "re-dock to a different monitor layout - leaving windows where they are"
+                fi
+                displaced=""; displaced_geoms=""
+            fi
+            log_state "after acting"
+            geoms_before="$geoms_now"
+            monitors_changed=0
+            windows_changed=1               # snapshot the result once calm
+            continue
+        fi
+        timeout=$(printf '%d.%06d' $(( left / 1000000 )) $(( left % 1000000 )))
+    fi
+    read -r -t "$timeout" line; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        case "$line" in
+            RRScreenChangeNotify*|RRNotify*)
+                monitors_changed=1
+                deadline=$(( $(usec) + settle_us )) ;;
+            ConfigureNotify*|MapNotify*|UnmapNotify*|DestroyNotify*)
+                windows_changed=1 ;;
+        esac
+    elif [ "$rc" -gt 128 ]; then            # timer expired
+        if [ "$monitors_changed" = 0 ] && [ "$windows_changed" = 1 ]; then
+            snapshot="$(windows)"
+            log "snapshot: $(grep -c . <<<"$snapshot") application window(s)"
+            windows_changed=0
+        fi                                  # a due monitor action runs at the loop top
+    else                                    # xev ended: the X session is gone
+        log "X session ended"
+        exit 0
+    fi
+done

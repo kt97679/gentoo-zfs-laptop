@@ -1,0 +1,225 @@
+#!/bin/bash
+# zbm-key-injection - ZFSBootMenu hook that keeps the pool key off disk: the passphrase is typed
+# once, in ZFSBootMenu, and reaches the booted system's initramfs in RAM only. Deployed by
+# ./deploy (group base) twice - /etc/zfsbootmenu/hooks/load-key.d/50-key-injection and
+# /etc/zfsbootmenu/hooks/boot-sel.d/90-key-injection; update-zbm builds both into the image. It
+# picks its stage by the directory it runs from:
+#   load-key.d  asks for the passphrase of the locked encryption root, unlocks it and keeps the
+#               passphrase in ZFSBootMenu's RAM (/run/key-injection, 0700/0600). If the root is
+#               locked again later (the menu re-imports a pool), the kept copy unlocks it.
+#   boot-sel.d  builds a RAM view of the chosen boot environment: its kernel, its os-release files
+#               and a copy of its initramfs, padded to 4 bytes, with a cpio archive appended that
+#               holds the passphrase (/key-injection/key, 0600) and a dracut pre-mount hook. It
+#               unmounts the boot environment and bind-mounts the view over its mountpoint, so
+#               ZFSBootMenu's own kexec line loads the copy and its own umount and pool export
+#               still work (a bind mount on the file inside would make that umount fail: "target
+#               is busy"). The kernel unpacks the appended archive over the initramfs; the hook
+#               loads the key before OpenZFS's mount hook would ask (keylocation=prompt) and
+#               deletes it.
+# On only while the encryption root has gentoo-laptop:key-injection=on. Anything missing or failing
+# leaves ZFSBootMenu as it is without this hook: its own prompt, and the system initramfs asks
+# again (OpenZFS's mount-zfs.sh). Written against ZFSBootMenu 3.1.0's kexec_kernel, which reads
+# after boot-sel.d only os-release, a devicetree if org.zfsbootmenu:devicetree is set (then this
+# hook does not inject), the kernel and the initramfs - re-read kexec_kernel when ZFSBootMenu is
+# updated. Tests: tools/test-key-injection.sh (stubs, a mount namespace, qemu boots).
+export LC_ALL=C            # byte lengths and plain sorting
+PROP="gentoo-laptop:key-injection"
+STATE=/run/key-injection   # RAM in ZFSBootMenu
+KEYS="$STATE/keys"
+VIEW="$STATE/view"
+INITRD_KEY=key-injection/key                 # in the booted system's initramfs
+HOOK_NAME=89-zfs-key-injection.sh
+TAG="key-injection"
+
+# ZFSBootMenu's logging (zinfo, zwarn) when present; say() also writes to the console, for the
+# cases where the system will ask for the passphrase a second time
+for f in /etc/zfsbootmenu.conf /lib/kmsg-log-lib.sh; do
+    # shellcheck disable=SC1090
+    [ -r "$f" ] && . "$f" >/dev/null 2>&1
+done
+command -v zinfo >/dev/null 2>&1 || zinfo() { :; }
+command -v zwarn >/dev/null 2>&1 || zwarn() { :; }
+say() { echo "$TAG: $*" >&2; zwarn "$TAG: $*"; }
+
+prop_on() { [ "$(zfs get -H -o value "$PROP" "$1" 2>/dev/null)" = on ]; }
+keyfile() { printf '%s/%s' "$KEYS" "${1//\//+}"; }   # dataset names cannot contain +
+size_of() {   # size in bytes (the image has ls, not stat or wc)
+    local out
+    out="$(ls -lnd -- "$1" 2>/dev/null)" || return 1
+    # shellcheck disable=SC2086
+    set -- $out
+    case "${5:-}" in ''|*[!0-9]*) return 1 ;; esac
+    echo "$5"
+}
+zeros() { local n="$1"; while [ "$n" -gt 0 ]; do printf '\0'; n=$((n - 1)); done; }
+is_mounted() { awk -v m="$1" '$2 == m {f = 1} END {exit !f}' /proc/self/mounts; }
+
+# --- load-key.d ---------------------------------------------------------------------------------
+load_key_stage() {
+    local enc="${ZBM_ENCRYPTION_ROOT:-}" kf tmp pass try
+    [ -n "$enc" ] || return 0
+    prop_on "$enc" || return 0
+    [ "$(zfs get -H -o value keystatus "$enc" 2>/dev/null)" = unavailable ] || return 0
+    [ "$(zfs get -H -o value keyformat "$enc" 2>/dev/null)" = passphrase ] || return 0
+    kf="$(keyfile "$enc")"
+    if [ -f "$kf" ]; then
+        if zfs load-key -L "file://$kf" "$enc" >/dev/null 2>&1; then
+            zinfo "$TAG: $enc unlocked with the kept passphrase"
+            return 0
+        fi
+        rm -f "$kf"
+    fi
+    [ -t 0 ] || return 0                       # nobody to ask: ZFSBootMenu decides
+    mkdir -p "$KEYS" && chmod 700 "$STATE" "$KEYS" || return 0
+    tmp="$kf.new"
+    for try in 1 2 3; do
+        printf "Enter passphrase for '%s' (key injection): " "$enc"
+        IFS= read -rs pass || { echo; break; }
+        echo
+        ( umask 077; printf '%s' "$pass" > "$tmp" )
+        unset pass
+        if zfs load-key -L "file://$tmp" "$enc"; then
+            mv -f "$tmp" "$kf"
+            zinfo "$TAG: $enc unlocked (try $try), passphrase kept in RAM for boot-sel.d"
+            return 0
+        fi
+        rm -f "$tmp"
+    done
+    return 1                                   # ZFSBootMenu asks with its own prompt
+}
+
+# --- boot-sel.d ---------------------------------------------------------------------------------
+# The dracut hook that travels in the appended archive (sourced by dracut's init: return, never
+# exit; POSIX sh). It uses what OpenZFS's dracut module provides: /lib/dracut-zfs-lib.sh
+# (decode_root_args, ZPOOL_IMPORT_OPTS) and dracut's info/warn.
+dracut_hook() {
+    cat <<EOF
+# $HOOK_NAME - dracut pre-mount hook, appended to this initramfs in RAM by ZFSBootMenu's
+# key-injection hook for one boot (it is not in /boot). Loads the pool key ZFSBootMenu put in
+# /$INITRD_KEY, then deletes it; on any failure OpenZFS's mount hook asks as usual.
+zki_load() {
+    [ -f /$INITRD_KEY ] || return 0
+    . /lib/dracut-zfs-lib.sh
+    if ! decode_root_args || [ "\$root" = zfs:AUTO ]; then
+        warn "ZFS: key injection: no root dataset named - asking instead"
+        return 0
+    fi
+    zki_ds="\$root"
+    modprobe zfs 2>/dev/null
+    udevadm settle
+    if ! zpool get -Ho value name "\${zki_ds%%/*}" >/dev/null 2>&1; then
+        # shellcheck disable=SC2086
+        zpool import -N \${ZPOOL_IMPORT_OPTS} "\${zki_ds%%/*}" || { warn "ZFS: key injection: import failed"; return 0; }
+    fi
+    zki_enc="\$(zfs get -Ho value encryptionroot "\$zki_ds")"
+    [ -n "\$zki_enc" ] && [ "\$zki_enc" != - ] || return 0
+    [ "\$(zfs get -Ho value keystatus "\$zki_enc")" = unavailable ] || return 0
+    if zfs load-key -L file:///$INITRD_KEY "\$zki_enc"; then
+        info "ZFS: key for \$zki_enc loaded from ZFSBootMenu's key injection"
+    else
+        warn "ZFS: the injected key did not unlock \$zki_enc - asking instead"
+    fi
+}
+zki_load
+rm -f /$INITRD_KEY
+rmdir /${INITRD_KEY%/*} 2>/dev/null
+unset -f zki_load
+unset zki_ds zki_enc
+EOF
+}
+
+newc() {   # newc NAME MODE [FILE] - one cpio "newc" entry on stdout (uid/gid 0, mtime 0)
+    local name="$1" mode="$2" file="${3:-}" size=0 nlink=1
+    if [ -n "$file" ]; then size="$(size_of "$file")" || return 1; fi
+    [ $((mode & 8#170000)) -ne $((8#040000)) ] || nlink=2
+    ino=$((ino + 1))
+    printf '070701%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X%08X' \
+        "$ino" "$mode" 0 0 "$nlink" 0 "$size" 0 0 0 0 $(( ${#name} + 1 )) 0
+    printf '%s\0' "$name"
+    zeros $(( (4 - (110 + ${#name} + 1) % 4) % 4 ))
+    [ -z "$file" ] || { cat "$file" && zeros $(( (4 - size % 4) % 4 )); }
+}
+
+key_archive() {   # key_archive KEYFILE HOOKFILE - the archive appended to the initramfs
+    ino=0
+    newc "${INITRD_KEY%/*}" $((8#040700)) &&
+    newc "$INITRD_KEY" $((8#100600)) "$1" &&
+    # dracut-ng sources hooks from /var/lib/dracut/hooks (older dracut: /lib/dracut/hooks); the
+    # kernel skips an entry whose directory is missing, and a second copy finds no key
+    newc "var/lib/dracut/hooks/pre-mount/$HOOK_NAME" $((8#100755)) "$2" &&
+    newc "lib/dracut/hooks/pre-mount/$HOOK_NAME" $((8#100755)) "$2" &&
+    newc 'TRAILER!!!' 0
+}
+
+drop_view() { if is_mounted "$VIEW"; then umount "$VIEW"; fi; rm -f "$STATE/archive" "$STATE/hook.sh"; }
+
+build_view() {   # build_view MNT KERNEL INITRD KEYFILE - the view in $VIEW
+    local mnt="$1" kernel="$2" initrd="$3" kf="$4" f size pad alen
+    drop_view
+    mkdir -p "$VIEW" && chmod 700 "$STATE" || return 1
+    mount -t tmpfs -o mode=0700 tmpfs "$VIEW" || return 1
+    mkdir -p "$VIEW${kernel%/*}" "$VIEW${initrd%/*}" || return 1
+    cp "$mnt$kernel" "$VIEW$kernel" || return 1
+    for f in usr/lib/os-release etc/os-release; do       # ZFSBootMenu's root= prefix
+        if [ -e "$mnt/$f" ] || [ -L "$mnt/$f" ]; then
+            mkdir -p "$VIEW/${f%/*}" && cp -P "$mnt/$f" "$VIEW/$f" || return 1
+        fi
+    done
+    ( umask 077; dracut_hook > "$STATE/hook.sh" && key_archive "$kf" "$STATE/hook.sh" > "$STATE/archive" ) \
+        || return 1
+    size="$(size_of "$mnt$initrd")" || return 1
+    pad=$(( (4 - size % 4) % 4 ))
+    { cat "$mnt$initrd" && zeros "$pad" && cat "$STATE/archive"; } > "$VIEW$initrd" || return 1
+    alen="$(size_of "$STATE/archive")" || return 1
+    [ "$(size_of "$VIEW$initrd")" = $(( size + pad + alen )) ] || return 1
+    rm -f "$STATE/archive" "$STATE/hook.sh"
+}
+
+boot_sel_stage() {
+    local be="${ZBM_SELECTED_BE:-}" kernel="${ZBM_SELECTED_KERNEL:-}" initrd="${ZBM_SELECTED_INITRAMFS:-}"
+    local mnt="${ZBM_SELECTED_MOUNTPOINT:-}" fs enc kf dtb rwo
+    [ -n "$be" ] && [ -n "$kernel" ] && [ -n "$initrd" ] && [ -n "$mnt" ] || return 0
+    fs="${be%@*}"
+    enc="$(zfs get -H -o value encryptionroot "$fs" 2>/dev/null)"
+    [ -n "$enc" ] && [ "$enc" != - ] || return 0
+    prop_on "$enc" || return 0
+    kf="$(keyfile "$enc")"
+    if [ ! -f "$kf" ]; then
+        say "no passphrase kept for $enc (ZFSBootMenu's own prompt unlocked it) - the system will ask again"
+        return 0
+    fi
+    dtb="$(zfs get -H -o value org.zfsbootmenu:devicetree "$fs" 2>/dev/null)"
+    if [ -n "$dtb" ] && [ "$dtb" != - ]; then
+        say "org.zfsbootmenu:devicetree is set on $fs - not injecting; the system will ask again"
+        return 0
+    fi
+    if ! is_mounted "$mnt" || [ ! -f "$mnt$kernel" ] || [ ! -f "$mnt$initrd" ]; then
+        say "$fs is not mounted at $mnt with $kernel and $initrd - not injecting"
+        return 0
+    fi
+    rwo="$(awk -v m="$mnt" '$2 == m {split($4, o, ","); r = o[1]} END {print r}' /proc/self/mounts)"
+    if ! build_view "$mnt" "$kernel" "$initrd" "$kf"; then
+        drop_view
+        say "could not build the boot image in RAM - not injecting; the system will ask again"
+        return 0
+    fi
+    if ! umount "$mnt"; then
+        drop_view
+        say "could not unmount $fs - not injecting; the system will ask again"
+        return 0
+    fi
+    if ! mount --bind "$VIEW" "$mnt"; then
+        say "could not mount the boot image over $mnt - not injecting; the system will ask again"
+        mount -o "zfsutil,${rwo:-ro}" -t zfs "$be" "$mnt" 2>/dev/null || mount -o "${rwo:-ro}" -t zfs "$be" "$mnt" \
+            || say "and could not mount $fs again - choose it in the menu once more"
+        drop_view
+        return 0
+    fi
+    zinfo "$TAG: $initrd of $fs boots with the key appended (RAM copy over $mnt)"
+}
+
+case "${0%/*}" in
+    */load-key.d) load_key_stage ;;
+    */boot-sel.d) boot_sel_stage ;;
+    *) echo "zbm-key-injection: ZFSBootMenu runs this from load-key.d or boot-sel.d" >&2; exit 2 ;;
+esac

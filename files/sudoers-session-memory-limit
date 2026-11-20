@@ -1,0 +1,5 @@
+# /etc/sudoers.d/zz-session-memory-limit - every user may cap the memory of their own desktop
+# session at login (the helper checks the session is theirs); the command, no arguments.
+# zz-: sudo applies the LAST matching rule and reads this directory in name order - read before
+# "wheel", wheel's password rule would win for its members and sudo -n would fail.
+ALL ALL=(root) NOPASSWD: /usr/local/sbin/session-memory-limit ""

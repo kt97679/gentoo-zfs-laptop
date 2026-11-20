@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Session memory limit
+Exec=sudo -n /usr/local/sbin/session-memory-limit
+OnlyShowIn=Unity;
+NoDisplay=true

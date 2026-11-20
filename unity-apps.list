@@ -1,0 +1,43 @@
+# unity-apps.list - applications for install-unity.sh: one or more category/name atoms per line.
+# Everything after # is ignored. Unavailable or misspelled entries are skipped with a warning.
+#
+# Already included with Unity's core (no need to list): mate-terminal, nemo (files), engrampa
+# (archives), VLC, nm-applet (network), and one each of a PDF viewer (evince, atril, papers), an
+# image viewer (eog, eom, loupe), a calculator (gnome-calculator, mate-calc) and a music player
+# (rhythmbox, audacious): Portage takes the first one unless another is already installed (a clean
+# install gets evince, eog and gnome-calculator). Listing another one below installs it after Unity;
+# depclean then offers to remove the first. The text editor is GNOME Text Editor: install-unity.sh
+# puts it in before Unity, so pluma is not pulled in. The minimal Unity drops the GNOME/extra app
+# bundles (tested: 128 packages fewer).
+
+www-client/firefox-bin
+www-client/google-chrome         # Google's own build (binary); its licence is accepted by the script
+net-im/zoom                      # keyword, licence and PipeWire flag are set by the script
+media-video/mpv                  # video player; mplayer-style keys, plays URLs via yt-dlp
+app-misc/glow                    # Markdown in the terminal (GURU, built from source; keyword set by the script)
+media-gfx/flameshot              # screenshots (set its keyboard shortcuts once, see notes)
+net-print/cups net-dns/avahi sys-auth/nss-mdns   # printing on a network printer (driverless IPP
+                                 # Everywhere / AirPrint); cupsd and avahi-daemon are enabled automatically
+app-office/libreoffice-bin       # prebuilt LibreOffice (no multi-hour compile)
+media-gfx/gimp
+app-emulation/qemu               # you are added to the kvm group for acceleration
+app-text/foliate                 # e-books: EPUB, MOBI/AZW3, FB2 and zipped FB2, CBZ comics
+app-editors/gnome-text-editor    # keeps drafts of all open documents, untitled ones too
+app-containers/podman            # rootless containers: runs Tribler (panel indicator included)
+media-fonts/noto media-fonts/noto-emoji   # wide script coverage and colour emoji
+
+## Optional
+# net-p2p/qbittorrent            # native torrent client (no built-in anonymity)
+# net-im/telegram-desktop-bin    # or Telegram's own self-updating build in ~/bin
+# sys-firmware/edk2-bin          # UEFI firmware (OVMF) for VMs
+# net-print/hplip                # HP's own drivers and tools, if driverless printing falls short
+# media-gfx/sane-airscan         # driverless scanning on a multifunction printer (with simple-scan)
+# media-video/mplayer
+# media-gfx/simple-scan          # scanning
+# net-p2p/transmission           # torrents
+# EiskaltDC++ (Direct Connect): net-p2p/eiskaltdcpp was removed from Gentoo in 2025 (unmaintained,
+#   build bugs) - not installable from here; container, local ebuild or another client undecided
+# unity-extra/unity-tweak-tool   # extra Unity settings: launcher, panel, themes
+# gnome-extra/gnome-system-monitor
+# app-crypt/seahorse             # GUI for saved passwords and SSH/GPG keys
+# sys-process/htop

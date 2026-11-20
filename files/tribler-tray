@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""tribler-tray - panel indicator for Tribler running in a rootless Podman container.
+
+Tribler runs headless in the container, with no access to your desktop session.
+This small indicator runs on the host and controls it:
+    status line, Open Tribler (web interface), Start, Stop, Update image, Quit indicator
+The first Start downloads Tribler's official image and creates the container. Updates happen
+only from "Update Tribler image" (Tribler stopped): it downloads the newest image, recreates the
+container from it and removes the old image; your data and the key stay.
+
+Files:  ~/.Tribler                         Tribler's own data (kept across updates)
+        ~/Downloads/Tribler                downloads
+        ~/.config/tribler-podman/api-key   secret for the web interface (created once)
+        ~/.cache/tribler-tray/icons        the two panel icons, written at start
+Status changes come from `podman events`, so the icon updates without polling. The icons are
+our own (a download arrow: solid = running, outline = stopped), not the theme's network icons,
+which looked like the network indicator.
+"""
+import os
+import secrets
+import subprocess
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3 as AppIndicator
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+NAME = "tribler"
+IMAGE = "ghcr.io/tribler/tribler:latest"
+PORT = 8085
+HOME = os.path.expanduser("~")
+CONF_DIR = os.path.join(HOME, ".config", "tribler-podman")
+KEY_FILE = os.path.join(CONF_DIR, "api-key")
+STATE_DIR = os.path.join(HOME, ".Tribler")
+DOWNLOAD_DIR = os.path.join(HOME, "Downloads", "Tribler")
+ICON_RUNNING = "tribler-tray-running"
+ICON_STOPPED = "tribler-tray-stopped"
+ICONS = {   # light glyphs for Unity's dark panel, 22 px
+    ICON_RUNNING: """<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+ <g fill="#dfdbd2">
+  <path d="M9 3h4v7h3.5L11 15.5 5.5 10H9z"/>
+  <rect x="4" y="17" width="14" height="2" rx="1"/>
+ </g>
+</svg>
+""",
+    ICON_STOPPED: """<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+ <g fill="none" stroke="#dfdbd2" stroke-width="1.5" stroke-linejoin="round" opacity="0.85">
+  <path d="M9.75 3.75h2.5v7h2.5L11 14.5 7.25 10.75h2.5z"/>
+  <rect x="4.75" y="17.25" width="12.5" height="1.5" rx="0.75"/>
+ </g>
+</svg>
+""",
+}
+
+
+def icon_dir():
+    """Write the panel icons where the indicator can find them; return that folder."""
+    cache = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+    folder = os.path.join(cache, "tribler-tray", "icons")
+    os.makedirs(folder, exist_ok=True)
+    for name, svg in ICONS.items():
+        path = os.path.join(folder, name + ".svg")
+        if not os.path.exists(path) or open(path).read() != svg:
+            with open(path, "w") as f:
+                f.write(svg)
+    return folder
+
+
+def api_key():
+    os.makedirs(CONF_DIR, mode=0o700, exist_ok=True)
+    if not os.path.exists(KEY_FILE):
+        with os.fdopen(os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
+            f.write(secrets.token_hex(16))
+    with open(KEY_FILE) as f:
+        return f.read().strip()
+
+
+def podman(*args):
+    return subprocess.run(["podman", *args], capture_output=True, text=True)
+
+
+def container_exists():
+    return podman("container", "exists", NAME).returncode == 0
+
+
+def container_running():
+    r = podman("inspect", "--format", "{{.State.Running}}", NAME)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def create_args():
+    # keep-id maps you to the image's user (uid 1000), so files in the mounted
+    # folders belong to you; -s = headless (no GUI or tray inside the container)
+    return ["create", "--name", NAME, "--net=host", "--userns=keep-id:uid=1000,gid=1000",
+            "-e", f"CORE_API_PORT={PORT}", "-e", f"CORE_API_KEY={api_key()}",
+            "-e", "LANG=C.UTF-8", "-e", "HOME=/home/ubuntu",
+            "-v", f"{STATE_DIR}:/home/ubuntu/.Tribler",
+            "-v", f"{DOWNLOAD_DIR}:/home/ubuntu/Downloads",
+            "--log-opt", "max-size=10mb",          # Tribler's console log must not grow for ever
+            IMAGE, "-s"]
+
+
+class Tray:
+    def __init__(self):
+        self.busy = False
+        self.ind = AppIndicator.Indicator.new_with_path(
+            "tribler-tray", ICON_STOPPED, AppIndicator.IndicatorCategory.APPLICATION_STATUS,
+            icon_dir())
+        self.ind.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+        menu = Gtk.Menu()
+        self.status = Gtk.MenuItem(label="Tribler: ...")
+        self.status.set_sensitive(False)
+        self.open = self._item(menu, "Open Tribler", self.on_open, first=self.status)
+        self.start = self._item(menu, "Start Tribler", self.on_start)
+        self.stop = self._item(menu, "Stop Tribler", self.on_stop)
+        self.update = self._item(menu, "Update Tribler image", self.on_update)
+        menu.append(Gtk.SeparatorMenuItem())
+        self._item(menu, "Quit indicator", lambda _w: Gtk.main_quit())
+        menu.show_all()
+        self.ind.set_menu(menu)
+        self.refresh()
+        self.watch_events()
+
+    @staticmethod
+    def _item(menu, label, callback, first=None):
+        if first is not None:
+            menu.append(first)
+            menu.append(Gtk.SeparatorMenuItem())
+        item = Gtk.MenuItem(label=label)
+        item.connect("activate", callback)
+        menu.append(item)
+        return item
+
+    def refresh(self, note=None):
+        running = container_running()
+        state = "running" if running else ("stopped" if container_exists() else "not set up yet")
+        text = note or state
+        self.status.set_label(f"Tribler: {text}")
+        self.ind.set_icon_full(ICON_RUNNING if running else ICON_STOPPED, f"Tribler {text}")
+        self.open.set_sensitive(running and not self.busy)
+        self.start.set_sensitive(not running and not self.busy)
+        self.stop.set_sensitive(running and not self.busy)
+        self.update.set_sensitive(not running and not self.busy)
+        return False
+
+    def run_steps(self, steps, note):
+        """Run podman commands one after another without blocking the panel."""
+        self.busy = True
+        self.refresh(note)
+
+        def step(remaining):
+            if not remaining:
+                self.busy = False
+                self.refresh()
+                return
+            what = " ".join(remaining[0][:2]) if remaining[0][0] == "image" else remaining[0][0]
+            # Gio.Subprocess, not GLib.spawn_async: PyGObject 3.5x's spawn_async adds
+            # CHILD_INHERITS_STDOUT to STDOUT_TO_DEV_NULL, GLib refuses the pair and the wrapper
+            # raises AssertionError - no podman ran and the menu stayed greyed out
+            try:
+                proc = Gio.Subprocess.new(["podman", *remaining[0]],
+                                          Gio.SubprocessFlags.STDOUT_SILENCE
+                                          | Gio.SubprocessFlags.STDERR_SILENCE)
+            except Exception as e:            # any failure here must not leave the menu greyed out
+                self.busy = False
+                self.refresh(f"could not run podman ({type(e).__name__})")
+                return
+
+            def done(p, result):
+                try:
+                    ok = p.wait_check_finish(result)
+                except GLib.Error:
+                    ok = False
+                if not ok:
+                    self.busy = False
+                    self.refresh("image download failed - check the network" if what == "pull"
+                                 else f"'podman {what}' failed - see: podman logs {NAME}")
+                    return
+                step(remaining[1:])
+            proc.wait_check_async(None, done)
+        step(steps)
+
+    def on_open(self, _w):
+        url = f"http://localhost:{PORT}/ui/#/downloads/all?key={api_key()}"
+        subprocess.Popen(["xdg-open", url])
+
+    def on_start(self, _w):
+        steps = []
+        if not container_exists():
+            os.makedirs(STATE_DIR, exist_ok=True)
+            os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+            steps += [["pull", IMAGE], create_args()]
+        self.run_steps(steps + [["start", NAME]], "starting...")
+
+    def on_stop(self, _w):
+        self.run_steps([["stop", "--time", "30", NAME]], "stopping...")
+
+    def on_update(self, _w):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        # image prune: the old image is left untagged and unused once the container is recreated
+        self.run_steps([["pull", IMAGE], ["rm", "--ignore", NAME], create_args(),
+                        ["image", "prune", "--force"]], "updating...")
+
+    def watch_events(self):
+        """Follow `podman events` for the container; restart the watcher if it ends."""
+        try:
+            res = GLib.spawn_async_with_pipes(
+                None, ["podman", "events", "--filter", f"container={NAME}", "--format", "{{.Status}}"],
+                None, GLib.SpawnFlags.SEARCH_PATH, None)
+            out = res[-2]                     # stdout fd (the tuple length differs between PyGObject versions)
+        except GLib.Error:
+            GLib.timeout_add_seconds(30, self._rewatch)
+            return
+        channel = GLib.IOChannel.unix_new(out)
+        GLib.io_add_watch(channel, GLib.PRIORITY_DEFAULT, GLib.IOCondition.IN | GLib.IOCondition.HUP,
+                          self.on_event)
+
+    def _rewatch(self):
+        self.watch_events()
+        return False
+
+    def on_event(self, channel, condition):
+        if condition & GLib.IOCondition.IN:
+            channel.readline()
+            if not self.busy:
+                GLib.idle_add(self.refresh)
+            return True
+        GLib.timeout_add_seconds(5, self._rewatch)        # podman events ended
+        return False
+
+
+if __name__ == "__main__":
+    Tray()
+    Gtk.main()

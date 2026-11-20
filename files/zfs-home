@@ -1,0 +1,128 @@
+#!/bin/bash
+# zfs-home - homes as ZFS datasets through shadow's own account hooks (deployed by ./deploy, group
+# base, as 50-zfs-home in /etc/shadow-maint/useradd-post.d, userdel-pre.d and userdel-post.d).
+# useradd and userdel run every file there with ACTION=useradd|userdel and SUBJECT=the user name,
+# so this works for plain `useradd -m`, `userdel [-r]` and the desktop's User Accounts panel
+# (accountsservice runs the same commands). FreeBSD's adduser and Solaris' useradd do this
+# themselves; Linux's shadow does it only for Btrfs subvolumes, hence this hook.
+#   useradd-post.d: a home /home/NAME that useradd made as a plain directory inside the /home
+#     dataset becomes the dataset POOL/home/NAME, skel files, owner and mode kept - sanoid
+#     snapshots datasets only (process_children_only). With Podman installed, also the image
+#     dataset POOL/containers/NAME at /var/lib/containers/NAME (rootless storage, storage.conf).
+#   userdel-pre.d, with -r only: unmounts the home dataset and leaves an empty directory for
+#     userdel to remove (a mount point cannot be rmdir'ed: userdel -r would end in "error removing
+#     directory", exit 12) - not when the user has processes and -f is not given (userdel refuses).
+#   userdel-post.d, with -r only: destroys POOL/home/NAME with its snapshots and POOL/containers/NAME.
+#     Without -r both stay where they are, as a home directory does on any system.
+# It acts only on /home/NAME directly in a ZFS /home; anything else is left to useradd/userdel.
+# A failure exits non-zero, which useradd/userdel report. Redo the useradd part (e.g. after
+# converting the containers layout): sudo env ACTION=useradd SUBJECT=NAME <this file>
+set -Eeuo pipefail
+PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+trap 'echo "zfs-home: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
+die() { echo "zfs-home: $*" >&2; exit 1; }
+name="${SUBJECT:-}"
+stage="$(basename "$(dirname "$(readlink -f "$0")")")"   # useradd-post.d, userdel-pre.d, userdel-post.d
+[[ "$name" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]] || exit 0
+exists() { zfs list -H -o name "$1" >/dev/null 2>&1; }
+read -r root_ds root_fs <<<"$(findmnt -n -o SOURCE,FSTYPE / || true)"
+[ "${root_fs:-}" = zfs ] || exit 0
+POOL="${root_ds%%/*}"
+read -r home_ds home_fs <<<"$(findmnt -n -o SOURCE,FSTYPE --mountpoint /home || true)"
+[ "${home_fs:-}" = zfs ] || exit 0
+ds="$home_ds/$name" home="/home/$name"
+
+# same contract as install-unity.sh's function of this name: keep the two copies identical
+# (tools/test-containers-dataset.sh fails if they differ)
+containers_dataset() {   # containers_dataset USER
+    local parent="$POOL/containers" child="$POOL/containers/$1" dir="/var/lib/containers/$1"
+    if zfs list -H -o name "$parent" >/dev/null 2>&1; then
+        if [ "$(zfs get -H -o value canmount "$parent")" != off ]; then
+            # older layout: one store, its owner's - not necessarily $1 (the account hook calls
+            # this for later users too): the owner of its mounted directory
+            local owner
+            owner="$(stat -c %U "$(zfs get -H -o value mountpoint "$parent")" 2>/dev/null)" || owner=""
+            case "$owner" in ""|root|UNKNOWN) owner=OWNER ;; esac   # OWNER: whose images it holds
+            die "$parent is mounted itself (older layout, $owner's images). Convert it:" \
+                "zfs rename $parent $POOL/containers-old;" \
+                "zfs create -o canmount=off -o mountpoint=/var/lib/containers" \
+                "-o com.sun:auto-snapshot=false $parent;" \
+                "zfs rename $POOL/containers-old $POOL/containers/$owner;" \
+                "zfs inherit mountpoint $POOL/containers/$owner${CONVERT_THEN:-}"
+        fi
+    else
+        zfs create -o canmount=off -o mountpoint=/var/lib/containers \
+            -o com.sun:auto-snapshot=false "$parent"
+    fi
+    zfs list -H -o name "$child" >/dev/null 2>&1 || zfs create "$child"
+    chown "$1:$1" "$dir"
+    chmod 700 "$dir"
+}
+
+remove=0 force=0
+if [ "$stage" != useradd-post.d ]; then   # userdel's options, from its command line (the hook's parent)
+    [ "$(basename "$(readlink -f "/proc/$PPID/exe" 2>/dev/null)")" = userdel ] || exit 0
+    while IFS= read -r -d '' a; do
+        case "$a" in
+            --) break ;;
+            --remove) remove=1 ;;
+            --force) force=1 ;;
+            --root*|--prefix*) exit 0 ;;   # another system's files: not ours
+            -[!-]*) a="${a#-}"
+                while [ -n "$a" ]; do
+                    case "${a:0:1}" in r) remove=1 ;; f) force=1 ;; R|P) exit 0 ;; esac
+                    a="${a:1}"
+                done ;;
+        esac
+    done < <(tail -z -n +2 "/proc/$PPID/cmdline")
+fi
+
+case "$stage" in
+useradd-post.d)
+    entry="$(getent passwd "$name")" || die "no user $name"
+    [ "$(cut -d: -f6 <<<"$entry")" = "$home" ] || exit 0           # a home elsewhere: not ours
+    if [ -d "$home" ] && ! findmnt -n --mountpoint "$home" >/dev/null; then
+        ! exists "$ds" || die "the dataset $ds exists (an earlier $name's home?) -" \
+            "$home stays a plain directory, not snapshotted; look at it: zfs list -r $home_ds"
+        tmp="/home/.$name.zfs-home-$$"
+        mv -- "$home" "$tmp"
+        if ! zfs create "$ds"; then mv -- "$tmp" "$home"; die "could not create $ds - $home stays a plain directory"; fi
+        if ! cp -a -- "$tmp/." "$home/"; then   # "DIR/." also gives the dataset's root DIR's owner and mode
+            zfs destroy -r "$ds"; rmdir "$home" 2>/dev/null || true; mv -- "$tmp" "$home"
+            die "could not copy $home into $ds - $home stays a plain directory"
+        fi
+        rm -rf -- "$tmp"
+        echo "zfs-home: $home is the dataset $ds"
+    fi
+    if command -v podman >/dev/null; then
+        CONVERT_THEN=" - then finish $name's part: sudo env ACTION=useradd SUBJECT=$name $(readlink -f "$0")"
+        containers_dataset "$name"
+        grep -q "^$name:" /etc/subuid 2>/dev/null \
+            || echo "zfs-home: $name has no subordinate ids (/etc/subuid) - rootless Podman needs them" >&2
+    fi ;;
+userdel-pre.d)
+    if [ "$remove" = 0 ] || ! exists "$ds"; then exit 0; fi
+    if [ "$(zfs get -H -o value mounted "$ds")" != yes ] || [ "$(zfs get -H -o value mountpoint "$ds")" != "$home" ]; then
+        exit 0
+    fi
+    if [ "$force" = 0 ] && pgrep -u "$name" >/dev/null; then exit 0; fi   # userdel refuses: change nothing
+    owner="$(stat -c %u:%g "$home")"
+    zfs unmount "$ds" 2>/dev/null || exit 0   # in use: userdel -r empties it, the post part destroys it
+    mkdir -p "$home"; chown "$owner" "$home"  # for userdel -r to remove (it checks the owner)
+    ;;
+userdel-post.d)
+    [ "$remove" = 1 ] || exit 0
+    if exists "$ds"; then
+        if [ "$(zfs get -H -o value mounted "$ds")" = yes ] && [ -n "$(ls -A "$home" 2>/dev/null)" ]; then
+            die "$home still has files after userdel -r - $ds kept"
+        fi
+        zfs destroy -r "$ds" 2>/dev/null || die "could not destroy $ds (in use?) - its files are gone;" \
+            "destroy it later: sudo zfs destroy -r $ds"
+        rmdir "$home" 2>/dev/null || true
+        echo "zfs-home: destroyed $ds"
+    fi
+    if exists "$POOL/containers/$name"; then
+        zfs destroy -r "$POOL/containers/$name"; rmdir "/var/lib/containers/$name" 2>/dev/null || true
+        echo "zfs-home: destroyed $POOL/containers/$name"
+    fi ;;
+esac

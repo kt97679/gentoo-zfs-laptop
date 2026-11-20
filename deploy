@@ -1,0 +1,193 @@
+#!/bin/bash
+# deploy - install the system files listed in deploy.list from this checkout as root-owned
+# copies, so root never runs a file your user account (or any program running as you) can
+# change. Run it from the checkout, as yourself:
+#     sudo ./deploy              the groups deployed before (every group the first time)
+#     sudo ./deploy --dry-run    show what would change; change nothing
+#     sudo ./deploy --group G    also deploy group G (groups: the first column of deploy.list)
+# It shows the checkout's commit and uncommitted changes (git runs as the checkout's owner, never
+# as root), then every new, changed and removed file with diffs, and asks before changing
+# anything. A file changed on this machine since the last deploy is marked; a file dropped from
+# deploy.list is removed only if nobody changed it. Changed sysctl files are applied and udev
+# rules reloaded. Destinations must be under /etc or /usr/local; sources must be regular files
+# inside the checkout; a sudoers file must pass visudo.
+# The installers use it too:  deploy --root DIR --yes --group NAME   (DIR: the new system).
+# State - what was deployed with checksums, and the groups: /var/lib/deploy/.
+set -Eeuo pipefail
+trap 'echo "deploy: unexpected failure in line $LINENO: $BASH_COMMAND" >&2' ERR
+(( EUID == 0 )) || exec sudo -- "$0" "$@"
+
+ROOT="" YES=0 DRY=0 GROUPS_ASKED=()
+usage() { sed -n '2,/^set -E/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --root)    ROOT="${2%/}"; shift 2 ;;
+        --yes)     YES=1; shift ;;
+        --dry-run) DRY=1; shift ;;
+        --group)   GROUPS_ASKED+=("$2"); shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "deploy: unknown argument '$1' (see deploy --help)" >&2; exit 2 ;;
+    esac
+done
+die() { echo "deploy: $*" >&2; exit 1; }
+[ -z "$ROOT" ] || { [[ "$ROOT" == /* ]] && [ -d "$ROOT" ]; } || die "--root needs an absolute directory, not '$ROOT'"
+repo="$(dirname "$(readlink -f "$0")")"
+list="$repo/deploy.list"
+state_dir="$ROOT/var/lib/deploy"
+sum() { sha256sum "$1" | cut -d' ' -f1; }
+
+# --- deploy.list: GROUP MODE DESTINATION SOURCE ---------------------------------------------
+declare -A src_of mode_of group_of
+dests=() all_groups=() bad=()
+n=0
+while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    read -r g m d s extra <<<"$line"
+    if [ -n "${extra:-}" ] || [ -z "${s:-}" ]; then bad+=("line $n: want GROUP MODE DESTINATION SOURCE"); continue; fi
+    [[ "$g" =~ ^[a-z0-9-]+$ ]] || bad+=("line $n: group '$g'")
+    [[ "$m" =~ ^0[0-7]{3}$ ]] || bad+=("line $n: mode '$m'")
+    if [[ ! "$d" =~ ^/(etc|usr/local)/[A-Za-z0-9._@+/-]+$ ]] || [[ "$d" =~ (^|/)\.{1,2}(/|$)|//|/$ ]]; then
+        bad+=("line $n: destination '$d' (allowed: a file under /etc or /usr/local)")
+    fi
+    if [[ ! "$s" =~ ^[A-Za-z0-9._@+/-]+$ ]] || [[ "$s" =~ (^|/)\.{1,2}(/|$)|//|^/ ]]; then
+        bad+=("line $n: source '$s'")
+    elif [ -L "$repo/$s" ] || [ ! -f "$repo/$s" ] || [[ "$(readlink -f "$repo/$s")" != "$repo/$s" ]]; then
+        bad+=("line $n: source $s is not a regular file in the checkout")
+    fi
+    [ -z "${src_of[$d]:-}" ] || bad+=("line $n: $d listed twice")
+    src_of[$d]="$s"; mode_of[$d]="$m"; group_of[$d]="$g"; dests+=("$d")
+    [[ " ${all_groups[*]} " == *" $g "* ]] || all_groups+=("$g")
+done < "$list"
+if [ "${#bad[@]}" -gt 0 ]; then printf 'deploy: %s\n' "${bad[@]}" >&2; die "deploy.list has errors - nothing changed"; fi
+
+# --- groups and state ------------------------------------------------------------------------
+declare -A prev_sum prev_group
+recorded=()
+if [ -r "$state_dir/deployed" ]; then
+    while read -r ps _pm pg pd; do prev_sum[$pd]="$ps"; prev_group[$pd]="$pg"; done < "$state_dir/deployed"
+fi
+[ ! -r "$state_dir/groups" ] || mapfile -t recorded < "$state_dir/groups"
+for g in "${GROUPS_ASKED[@]}"; do
+    [[ " ${all_groups[*]} " == *" $g "* ]] || die "no group '$g' in deploy.list (groups: ${all_groups[*]})"
+done
+if [ "${#GROUPS_ASKED[@]}" -gt 0 ]; then selected=("${GROUPS_ASKED[@]}")
+elif [ "${#recorded[@]}" -gt 0 ]; then selected=("${recorded[@]}")
+else selected=("${all_groups[@]}"); echo "first deploy here: every group (${all_groups[*]})"; fi
+in_selected() { [[ " ${selected[*]} " == *" $1 "* ]]; }
+
+# --- the checkout ----------------------------------------------------------------------------
+echo "checkout: $repo"
+if [ -d "$repo/.git" ] && command -v git >/dev/null; then
+    owner="$(stat -c %U "$repo")"
+    as_owner() { if [ "$owner" = root ]; then "$@"; else runuser -u "$owner" -- "$@"; fi; }
+    echo "commit:   $(as_owner git -C "$repo" log -1 --format='%h %s (%cr)' 2>/dev/null || echo '?')"
+    changes="$(as_owner git -C "$repo" status --short 2>/dev/null || echo '?')"
+    if [ -z "$changes" ]; then echo "uncommitted changes: none"
+    else echo "uncommitted changes (deployed as they are):"; while IFS= read -r c; do echo "    $c"; done <<<"$changes"; fi
+else
+    echo "(not a git checkout - no commit to show)"
+fi
+echo "groups:   ${selected[*]}${ROOT:+   (root: $ROOT)}"
+
+# --- the plan ----------------------------------------------------------------------------------
+plan=() unchanged=0 problems=()
+for d in "${dests[@]}"; do
+    in_selected "${group_of[$d]}" || continue
+    f="$ROOT$d" s="$repo/${src_of[$d]}"
+    if [ -L "$f" ]; then problems+=("$d is a symbolic link - not touched"); continue; fi
+    if [ ! -e "$f" ]; then plan+=("new $d"); continue; fi
+    [ -f "$f" ] || { problems+=("$d exists and is not a regular file"); continue; }
+    cur="$(sum "$f")"
+    note=""
+    if [ -n "${prev_sum[$d]:-}" ] && [ "$cur" != "${prev_sum[$d]}" ]; then note="changed on this machine since the last deploy"
+    elif [ -z "${prev_sum[$d]:-}" ]; then note="not deployed before"; fi
+    if [ "$cur" != "$(sum "$s")" ]; then plan+=("changed $d $note")
+    elif [ "$(stat -c '%u:%g 0%a' "$f")" != "0:0 ${mode_of[$d]}" ]; then plan+=("owner/mode $d")
+    else unchanged=$((unchanged + 1)); fi
+done
+for d in "${!prev_sum[@]}"; do   # deployed before, gone from deploy.list
+    [ -z "${src_of[$d]:-}" ] || continue
+    f="$ROOT$d"
+    if [ ! -e "$f" ]; then plan+=("forget $d")
+    elif [ -L "$f" ] || [ ! -f "$f" ] || [ "$(sum "$f")" != "${prev_sum[$d]}" ]; then
+        problems+=("$d was dropped from deploy.list but changed on this machine - left in place")
+        plan+=("forget $d")
+    else plan+=("remove $d"); fi
+done
+[ "${#problems[@]}" = 0 ] || printf '!!! %s\n' "${problems[@]}"
+declare -A new_sum
+for d in "${!prev_sum[@]}"; do new_sum[$d]="${prev_sum[$d]}"; done
+write_state() {   # what is installed now: every file of the deployed groups, with its checksum
+    local d g
+    for d in "${dests[@]}"; do
+        if in_selected "${group_of[$d]}" && [ -f "$ROOT$d" ] && [ ! -L "$ROOT$d" ]; then new_sum[$d]="$(sum "$ROOT$d")"; fi
+    done
+    mkdir -p "$state_dir"
+    for d in "${!new_sum[@]}"; do
+        printf '%s %s %s %s\n' "${new_sum[$d]}" "${mode_of[$d]:-0}" "${group_of[$d]:-${prev_group[$d]:-?}}" "$d"
+    done | sort -k4 > "$state_dir/deployed"
+    for g in "${all_groups[@]}"; do
+        if in_selected "$g" || [[ " ${recorded[*]} " == *" $g "* ]]; then echo "$g"; fi
+    done > "$state_dir/groups"
+}
+if [ "${#plan[@]}" = 0 ]; then
+    echo "nothing to do ($unchanged files up to date)"
+    [ "$DRY" = 1 ] || write_state
+    [ "${#problems[@]}" = 0 ] || exit 1
+    exit 0
+fi
+echo
+for p in "${plan[@]}"; do
+    read -r what d note <<<"$p"
+    case "$what" in
+        new)     printf '%-11s %s  (%s lines, mode %s)\n' new "$d" "$(wc -l < "$repo/${src_of[$d]}")" "${mode_of[$d]}" ;;
+        changed) printf '%-11s %s%s\n' changed "$d" "${note:+  - $note}" ;;
+        *)       printf '%-11s %s\n' "$what" "$d" ;;
+    esac
+done
+echo "unchanged:  $unchanged files"
+for p in "${plan[@]}"; do
+    read -r what d _ <<<"$p"
+    [ "$what" = changed ] || continue
+    echo
+    diff -u --label "installed $d" --label "checkout ${src_of[$d]}" "$ROOT$d" "$repo/${src_of[$d]}" || true
+done
+[ "$DRY" = 0 ] || { echo; echo "dry run - nothing changed"; exit 0; }
+if [ "$YES" = 0 ]; then
+    echo
+    read -rp "Apply these ${#plan[@]} changes? [y/N] " a || a=""
+    [[ "$a" == [yY]* ]] || { echo "nothing changed"; exit 0; }
+fi
+
+# --- apply -------------------------------------------------------------------------------------
+failed=0
+for p in "${plan[@]}"; do
+    read -r what d _ <<<"$p"
+    f="$ROOT$d"
+    case "$what" in
+        remove) rm -f "$f"; echo "removed $d"; unset 'new_sum[$d]' ;;
+        forget) unset 'new_sum[$d]' ;;
+        *)
+            mkdir -p "$(dirname "$f")"
+            tmp="$(mktemp "$(dirname "$f")/.deploy.XXXXXX")"
+            cat "$repo/${src_of[$d]}" > "$tmp"
+            chown 0:0 "$tmp"; chmod "${mode_of[$d]}" "$tmp"
+            if [[ "$d" == /etc/sudoers.d/* ]] && command -v visudo >/dev/null && ! visudo -cqf "$tmp" >/dev/null 2>&1; then
+                rm -f "$tmp"; echo "!!! $d: visudo rejects it - not installed" >&2; failed=1; continue
+            fi
+            mv -f "$tmp" "$f"
+            new_sum[$d]="$(sum "$f")"
+            echo "installed $d"
+            if [ -z "$ROOT" ] && [[ "$d" == /etc/sysctl.d/*.conf ]]; then
+                sysctl -q -p "$f" || echo "!!! sysctl -p $d failed" >&2
+            fi
+            if [ -z "$ROOT" ] && [[ "$d" == /etc/udev/rules.d/*.rules ]] && command -v udevadm >/dev/null; then
+                udevadm control --reload || echo "!!! udevadm control --reload failed" >&2
+            fi ;;
+    esac
+done
+write_state
+[ "$failed" = 0 ] || die "some files were not installed (above)"
+[ "${#problems[@]}" = 0 ] || die "deployed, except the files named with !!! above"
+echo "deployed"

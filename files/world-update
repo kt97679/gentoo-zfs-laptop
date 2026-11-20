@@ -1,0 +1,281 @@
+#!/bin/bash
+# world-update [emerge options] - update a laptop installed by install-gentoo.sh (adapted from
+# kt97679/misc gentoo/oracle-cloud/world-update.sh; the VM's kernel build does not apply here:
+# the kernel is gentoo-kernel-bin and ZFSBootMenu boots it):
+#   1. on battery: asks first;
+#   2. syncs the repositories only if the Gentoo tree is older than a day (cron syncs daily);
+#   3. refreshes the always-from-source list (ehooks-from-source), if installed, then runs the
+#      plugins' "before-update" stage (see Plugins below);
+#   4. snapshots the root dataset (pre-update-DATE) - roll back from ZFSBootMenu if the update
+#      breaks the system. When the run ends, however it ends (done, declined, failed, Ctrl-C),
+#      that snapshot is removed again if emerge merged and removed nothing, and only the newest 5
+#      pre-update snapshots are kept. sanoid's own snapshots (autosnap_*) are not touched;
+#   5. updates @world (and @ehooks-rebuild with the gentoo-unity7 overlay) - emerge asks first;
+#      builds are quiet (one line a package; a failed build's log is printed whole, Portage's
+#      default), so this log stays small - a run that compiled webkit-gtk loud made it 106 MB;
+#   6. rebuilds packages using old libraries (@preserved-rebuild);
+#   7. if the kernel or ZFS changed: checks the new initramfs (the zfs module must be in it, a pool
+#      key file must not: ZFSBootMenu's key-injection hook brings the key in RAM) and rebuilds
+#      ZFSBootMenu (update-zbm, which also checks that the image holds the hooks);
+#   8. removes packages nothing needs (emerge asks), old kernels included - except the running
+#      kernel, which the set @running-kernel keeps until you have booted a newer one - then the
+#      /boot files of kernels whose package is gone (the kernel package leaves them), old source
+#      files and old binary packages;
+#   9. runs the plugins' "after-update" stage;
+#  10. reports configuration files to merge, unread news, security advisories, failed plugins, a
+#      pool key file found in step 7,
+#      any log over 50 MB in /var/log or the homes (a safety net for logs nothing trims; logrotate's
+#      dated copies, NAME-YYYYMMDD[.gz], are skipped - logrotate trims them), and whether the run's
+#      cgroup - the desktop session's, from a terminal there - went over its soft memory cap
+#      (session-memory-limit) while it ran: slowed, never stopped; with how long its tasks waited
+#      on memory meanwhile (memory.pressure "some" total, when the kernel has PSI).
+# Plugins: executable files in /etc/world-update.d, run in name order with the stage as their one
+# argument: "before-update" (after the sync, before the snapshot and the world emerge - e.g. write
+# an ebuild to a local repository) and "after-update" (after the cleanup). A plugin exits 0 for a
+# stage it has no use for. Names are letters, digits, - and _ only (like run-parts: x.bak, x~ and
+# data files beside the plugins are skipped); plugins and the directory must be owned by root and
+# writable only by root, or they are not run. A failing plugin is reported; the update goes on.
+# Extra arguments go to the world emerge, e.g. world-update --exclude www-client/firefox-bin
+# The output is also appended to /var/log/world-update.log.
+set -Eeuo pipefail
+(( EUID == 0 )) || exec sudo -- "$0" "$@"
+
+LOG=/var/log/world-update.log
+KEEP_SNAPSHOTS=5
+exec > >(trap '' INT; exec tee -a "$LOG") 2>&1   # tee ignores Ctrl-C: the messages after it still show
+# The soft memory cap of the cgroup this run is in: its memory.events "high" counter (times the
+# cgroup went over memory.high) is read now and again in the report.
+mem_cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)"
+mem_events() { awk '$1 == "high" {print $2}' "$mem_cg/memory.events" 2>/dev/null || true; }
+# microseconds any task of the cgroup waited on memory, since it was made (PSI; empty without)
+mem_stall() { sed -n 's/^some .*total=\([0-9]*\).*/\1/p' "$mem_cg/memory.pressure" 2>/dev/null || true; }
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+dur() { if [ "$1" -ge 3600 ]; then printf '%d h %d min' $(($1 / 3600)) $(($1 % 3600 / 60));
+        elif [ "$1" -ge 60 ]; then printf '%d min %d s' $(($1 / 60)) $(($1 % 60)); else printf '%d s' "$1"; fi; }
+mem_high_start="$(mem_events)" mem_stall_start="$(mem_stall)"
+die()  { echo "ERROR: $*" >&2; exit 1; }
+step() { printf '\n\033[1;32m>>> %s\033[0m\n' "$*"; }
+PLUGIN_DIR=/etc/world-update.d
+failed_plugins=()
+root_only() {   # owned by root, not writable by group or others
+    [ "$(stat -c %u "$1")" = 0 ] && (( (8#$(stat -c %a "$1") & 8#022) == 0 ))
+}
+run_plugins() {   # run_plugins STAGE
+    local stage="$1" p name rc found=0
+    [ -d "$PLUGIN_DIR" ] || return 0
+    for p in "$PLUGIN_DIR"/*; do
+        name="${p##*/}"
+        if [ ! -f "$p" ] || [ ! -x "$p" ] || [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then continue; fi
+        [ "$found" = 1 ] || { step "Plugins: $stage"; found=1; }
+        if ! root_only "$PLUGIN_DIR" || ! root_only "$p"; then
+            echo "--- $name: not run - it and $PLUGIN_DIR must be owned by root and writable only by root"
+            failed_plugins+=("$name: unsafe ownership or permissions"); continue
+        fi
+        echo "--- $name"
+        rc=0; "$p" "$stage" || rc=$?
+        if [ "$rc" != 0 ]; then
+            echo "--- $name failed (exit $rc) - going on"
+            failed_plugins+=("$name $stage: exit $rc")
+        fi
+    done
+}
+trap 'echo "FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
+echo "=== world-update started $(date '+%F %T')"
+
+on_battery() {  # a mains supply exists and none is online
+    local d mains=0
+    for d in /sys/class/power_supply/*; do
+        [ "$(cat "$d/type" 2>/dev/null)" = Mains ] || continue
+        mains=1
+        [ "$(cat "$d/online" 2>/dev/null)" = 1 ] && return 1
+    done
+    [ "$mains" = 1 ]
+}
+gentoo_tree_fresh() {   # Gentoo tree snapshot younger than 24 h
+    local f=/var/db/repos/gentoo/metadata/timestamp.chk t
+    [ -r "$f" ] || return 1
+    t="$(date -d "$(head -n1 "$f")" +%s 2>/dev/null)" || return 1
+    [ $(( $(date +%s) - t )) -lt 86400 ]
+}
+newest_kernel() {   # newest kernel with both its modules and its image in /boot
+    local d v
+    for d in /lib/modules/*; do   # (if, not &&: a false test as the loop's last command would
+        v="${d##*/}"              #  fail the pipeline under pipefail and stop the script)
+        if [ -e "/boot/vmlinuz-$v" ]; then echo "$v"; fi
+    done | sort -V | tail -n1
+}
+versions() {    # the installed versions a ZFSBootMenu rebuild depends on
+    local a
+    for a in virtual/dist-kernel sys-fs/zfs sys-fs/zfs-kmod; do portageq best_version / "$a" || true; done
+}
+
+if on_battery; then
+    read -rp "Running on battery - a world update can take a while. Continue? [y/N] " a
+    [[ "$a" == [yY]* ]] || { echo "Stopped: plug in and run world-update again."; exit 0; }
+fi
+
+step "Repositories"
+if gentoo_tree_fresh; then
+    echo "Gentoo tree is less than 24 h old - not syncing"
+else
+    emaint sync -a
+fi
+
+if [ -x /usr/local/sbin/ehooks-from-source ]; then
+    step "Packages that must be built from source"
+    /usr/local/sbin/ehooks-from-source
+fi
+run_plugins before-update
+
+step "Snapshot of the root dataset"
+root_ds="$(findmnt -n -o SOURCE /)"
+[ "$(findmnt -n -o FSTYPE /)" = zfs ] || die "/ is not on ZFS ($root_ds)"
+EMERGE_LOG=/var/log/emerge.log
+run_start="$(date +%s)"   # emerge.log lines begin with their epoch second: this run's are >= run_start
+settle_snapshot() (   # drop this run's snapshot if nothing was merged or removed; keep 5
+    trap - ERR; set +e   # (a subshell: these stay inside)
+    # By time, not by position: logrotate may rename emerge.log during the run (its newest copy
+    # stays uncompressed, delaycompress), so read emerge.log and every copy written since the start.
+    changes="$(find "${EMERGE_LOG%/*}" -maxdepth 1 -name "${EMERGE_LOG##*/}*" ! -name '*.gz' \
+            -newermt "@$((run_start - 1))" -exec cat {} + 2>/dev/null \
+        | awk -F: -v t="$run_start" '$1 + 0 >= t' \
+        | grep -cE '>>> emerge \(|=== Unmerging|>>> unmerge success')"   # grep -c reads it all
+    step "Pre-update snapshots"
+    if [ "${changes:-0}" = 0 ]; then
+        zfs destroy "$snap" && echo "nothing was merged or removed - removed $snap"
+    else
+        echo "kept $snap (to undo this update: boot it from ZFSBootMenu)"
+    fi
+    mapfile -t old < <(zfs list -H -t snapshot -o name -s creation "$root_ds" | grep '@pre-update-' | head -n "-$KEEP_SNAPSHOTS")
+    for s in "${old[@]}"; do zfs destroy "$s" && echo "removed old $s"; done
+)
+snap="$root_ds@pre-update-$(date +%Y%m%d-%H%M%S)"
+zfs snapshot "$snap"
+trap settle_snapshot EXIT   # however the run ends; a finished run settles before its report
+echo "created $snap (to undo the update: boot this snapshot from ZFSBootMenu)"
+
+step "Updating @world"
+sets=(@world)
+available="$(emerge --list-sets)"   # captured first: grep -q in a pipe can SIGPIPE the writer (pipefail)
+grep -qx ehooks-rebuild <<<"$available" && sets+=(@ehooks-rebuild)
+before="$(versions)"
+emerge --ask --verbose --quiet-build=y --update --deep --changed-use --with-bdeps=y "${sets[@]}" "$@" \
+    || die "the world update stopped (declined, failed or Ctrl-C) - nothing after it was run"
+
+step "Rebuilding packages that use old libraries"
+emerge --quiet-build=y @preserved-rebuild
+
+after="$(versions)"
+initramfs_keys=""
+if [ "$before" != "$after" ]; then
+    step "Kernel or ZFS changed - checking the initramfs and rebuilding ZFSBootMenu"
+    diff <(echo "$before") <(echo "$after") | sed -n 's/^[<>] /  /p' || true   # diff exits 1: differs
+    kver="$(newest_kernel)"
+    [ -n "$kver" ] || die "no installed kernel found in /boot"
+    listing="$(lsinitrd "/boot/initramfs-$kver.img")"   # captured first: grep -q in a pipe trips pipefail
+    grep -q '/zfs\.ko' <<<"$listing" || die "zfs module missing from /boot/initramfs-$kver.img - do not reboot"
+    # A pool key file there is a leak, not a boot problem (the key comes from ZFSBootMenu, in RAM):
+    # reported below, the run goes on.
+    initramfs_keys="$(grep -oE 'etc/zfs/[^ ]*\.key$' <<<"$listing" | paste -sd' ' || true)"
+    if [ -n "$initramfs_keys" ]; then
+        echo "WARNING: /boot/initramfs-$kver.img holds a pool key file: $initramfs_keys (see the end)"
+    else
+        echo "initramfs for $kver contains zfs and no pool key file"
+    fi
+    update-zbm
+fi
+
+step "Removing packages nothing needs"
+# depclean keeps only the newest kernel package, so right after a kernel update it would take the
+# running kernel's modules. The set @running-kernel (in world_sets, so part of @world) names the
+# package of the running kernel; once a newer kernel is running, the older one is free to go.
+running="$(uname -r)"; newest="$(newest_kernel)"
+running_pkg="$(portageq owners / "/lib/modules/$running/kernel" 2>/dev/null | grep '^sys-kernel/' | head -n1 || true)"
+mkdir -p /etc/portage/sets
+if [ -n "$running_pkg" ]; then
+    echo "=$running_pkg" > /etc/portage/sets/running-kernel
+    echo "keeping $running_pkg (the running kernel) through @running-kernel"
+else
+    : > /etc/portage/sets/running-kernel
+    echo "the running kernel $running belongs to no installed package - nothing to keep"
+fi
+grep -qx '@running-kernel' /var/lib/portage/world_sets 2>/dev/null \
+    || echo '@running-kernel' >> /var/lib/portage/world_sets
+[ -z "$newest" ] || [ "$running" = "$newest" ] \
+    || echo "the newest kernel, $newest, is not running yet: reboot into it; the next run removes $running"
+emerge --ask --depclean || echo "depclean skipped"
+
+step "Kernel files in /boot whose kernel package is gone"
+# installkernel copies image, initramfs, System.map and config to /boot; removing the package
+# (gentoo-kernel-bin) leaves them, and ZFSBootMenu would still offer a kernel without modules.
+gone=0
+for img in /boot/vmlinuz-*; do
+    [ -e "$img" ] || continue
+    v="${img#/boot/vmlinuz-}"; v="${v%.old}"
+    [ -d "/lib/modules/$v" ] || [ "$v" = "$running" ] && continue
+    for f in "vmlinuz-$v" "System.map-$v" "config-$v" "initramfs-$v.img"; do
+        for g in "/boot/$f" "/boot/$f.old"; do [ ! -e "$g" ] || { rm -f "$g"; echo "removed $g"; gone=1; }; done
+    done
+done
+[ "$gone" = 1 ] || echo "none"
+
+step "Cleaning old source files and binary packages"
+eclean-dist --deep
+eclean-pkg --deep
+
+run_plugins after-update
+trap - EXIT; settle_snapshot
+
+step "Things to look at"
+cfg="$(find /etc -name '._cfg[0-9][0-9][0-9][0-9]_*' 2>/dev/null | wc -l)"
+news="$(eselect news count new 2>/dev/null || echo 0)"
+echo "configuration files to merge: $cfg"
+[ "$cfg" = 0 ] || echo "  merge them with: dispatch-conf"
+echo "unread news: $news"
+[ "$news" = 0 ] || echo "  read them with: eselect news read"
+rc=0; affected="$(glsa-check --test all 2>/dev/null)" || rc=$?   # 0: none, 6: listed, else error
+case "$rc" in
+    0) echo "security advisories: none affect this system" ;;
+    6) echo "security advisories affecting this system (details: glsa-check --dump ID):"
+       while read -r id; do echo "  $id"; done <<<"$affected" ;;
+    *) echo "security advisories: glsa-check failed (exit $rc) - run it by hand: glsa-check --test all" ;;
+esac
+# A safety net for logs nothing trims (an application's own log, a desktop session of months):
+# every log file over 50 MB in /var/log and in the homes - not logrotate's dated copies.
+big="$( { find /var/log -xdev -regextype posix-extended -type f \
+              ! -regex '.*-[0-9]{8}(\.(gz|xz|zst|bz2|lz4))?' -size +50M || true
+          find /home -mindepth 2 -maxdepth 5 -type f \( -name '*.log' -o -name '*.log.*' \
+              -o -name '.xsession-errors*' \) -size +50M || true; } 2>/dev/null | sort)"
+if [ -z "$big" ]; then
+    echo "logs over 50 MB: none"
+else
+    echo "logs over 50 MB - nothing trims them; see whether they need rotation:"
+    while read -r f; do printf '  %s %s\n' "$(du -h --apparent-size "$f" | cut -f1)" "$f"; done <<<"$big"
+fi
+mem_limit="$(cat "$mem_cg/memory.high" 2>/dev/null || true)"; mem_high_end="$(mem_events)" mem_stall_end="$(mem_stall)"
+waited=""
+if [[ "$mem_stall_start" =~ ^[0-9]+$ && "$mem_stall_end" =~ ^[0-9]+$ ]]; then
+    waited=" - its tasks waited on memory $(dur $(( (mem_stall_end - mem_stall_start) / 1000000 ))) of the run's $(dur "$SECONDS")"
+fi
+if [[ ! "$mem_limit" =~ ^[0-9]+$ ]] || [ -z "$mem_high_start" ] || [ -z "$mem_high_end" ]; then
+    echo "memory cap: none on this run"
+elif [ "$mem_high_end" -gt "$mem_high_start" ]; then
+    echo "memory cap: HIT - this session went over its $(gib "$mem_limit") GiB cap" \
+        "$((mem_high_end - mem_high_start)) time(s) during the run and was slowed, not stopped$waited" \
+        "(everything in the session shares the cap; session-memory-limit)"
+else
+    echo "memory cap: not reached ($(gib "$mem_limit") GiB)"
+fi
+if [ -n "$initramfs_keys" ]; then
+    echo "pool key file in the new initramfs: $initramfs_keys - readable by anyone who can read"
+    echo "  /boot; key injection needs none: drop it from /etc/dracut.conf.d, then"
+    echo "  emerge --config sys-kernel/gentoo-kernel-bin"
+fi
+if [ "${#failed_plugins[@]}" = 0 ]; then
+    [ ! -d "$PLUGIN_DIR" ] || echo "plugins: all ran fine"
+else
+    echo "plugins that failed (their output is above and in the log):"
+    for f in "${failed_plugins[@]}"; do echo "  $f"; done
+fi
+echo
+echo "=== world-update finished $(date '+%F %T') - log: $LOG"

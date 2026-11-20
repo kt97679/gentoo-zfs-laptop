@@ -1,0 +1,5 @@
+#!/bin/sh
+# /etc/local.d/battery.start - ThinkPad charge limits at boot: 75-80 % on the dock, 100 % elsewhere
+# (udev keeps them right when the dock comes or goes). The values and the "charge to full before a
+# trip" command: see /usr/local/sbin/battery-limits.
+exec /usr/local/sbin/battery-limits apply

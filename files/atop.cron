@@ -1,0 +1,6 @@
+# /etc/cron.d/atop - a new atop file each day (deployed by ./deploy, group base). atop.daily ends the
+# running recorder with a final sample, starts one writing atop_YYYYMMDD, and deletes files older
+# than LOGGENERATIONS days (/etc/default/atop). The package ships this line only as documentation
+# (atop.cronsysv); on OpenRC nothing else rotates. Only while the service runs: a stopped atop stays
+# stopped.
+0 0 * * * root rc-service atop status >/dev/null 2>&1 && /usr/share/atop/atop.daily &

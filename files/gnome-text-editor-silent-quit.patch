@@ -1,0 +1,78 @@
+# GNOME Text Editor: quit without the save-changes prompt when "Restore Session" is on.
+# Unsaved documents (untitled or modified files) are kept as drafts and restored at the
+# next start - the same mechanism the editor already uses after a logout or a crash.
+# Closing a single tab still asks; with "Restore Session" off nothing changes.
+# Gentoo: /etc/portage/patches/app-editors/gnome-text-editor/silent-quit.patch
+
+diff --git a/src/editor-application-actions.c b/src/editor-application-actions.c
+index 7ccc0ec..8814d90 100644
+--- a/src/editor-application-actions.c
++++ b/src/editor-application-actions.c
+@@ -284,6 +284,20 @@ editor_application_actions_quit (GSimpleAction *action,
+   g_assert (G_IS_SIMPLE_ACTION (action));
+   g_assert (EDITOR_IS_APPLICATION (self));
+ 
++  /* Silent quit (local patch): with "Restore Session" enabled, quit without
++   * asking. The session save below writes a draft of every unsaved document
++   * and the next start restores them, just as after a logout or a crash.
++   */
++  if (g_settings_get_boolean (self->settings, "restore-session"))
++    {
++      editor_session_save_async (self->session,
++                                 TRUE,
++                                 NULL,
++                                 editor_application_actions_quit_cb,
++                                 g_object_ref (self));
++      return;
++    }
++
+   unsaved = g_ptr_array_new_with_free_func (g_object_unref);
+   for (guint i = 0; i < self->session->pages->len; i++)
+     {
+diff --git a/src/editor-window.c b/src/editor-window.c
+index cf527cc..d0297de 100644
+--- a/src/editor-window.c
++++ b/src/editor-window.c
+@@ -316,6 +316,25 @@ editor_window_confirm_cb (GObject      *object,
+     }
+ }
+ 
++/* Silent quit (local patch): is this the only editor window left? */
++static gboolean
++editor_window_is_last_window (EditorWindow *self)
++{
++  GApplication *app = g_application_get_default ();
++  guint n_windows = 0;
++
++  if (!GTK_IS_APPLICATION (app))
++    return FALSE;
++
++  for (GList *iter = gtk_application_get_windows (GTK_APPLICATION (app)); iter; iter = iter->next)
++    {
++      if (EDITOR_IS_WINDOW (iter->data))
++        n_windows++;
++    }
++
++  return n_windows <= 1;
++}
++
+ static gboolean
+ editor_window_close_request (GtkWindow *window)
+ {
+@@ -338,6 +357,16 @@ editor_window_close_request (GtkWindow *window)
+         g_ptr_array_add (unsaved, g_object_ref (page));
+     }
+ 
++  if (unsaved->len > 0 && editor_window_is_last_window (self))
++    {
++      /* Silent quit (local patch): let the application's quit action decide.
++       * It keeps unsaved documents as drafts when "Restore Session" is on and
++       * asks as usual when it is off.
++       */
++      g_action_group_activate_action (G_ACTION_GROUP (g_application_get_default ()), "quit", NULL);
++      return TRUE;
++    }
++
+   if (unsaved->len > 0)
+     {
+       _editor_save_changes_dialog_run_async (GTK_WINDOW (self),

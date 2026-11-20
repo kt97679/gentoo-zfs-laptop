@@ -1,0 +1,29 @@
+#!/bin/sh
+# Rebuild ZFSBootMenu from the installed kernel/ZFS/dracut and refresh the fallback copy.
+set -e
+mountpoint -q /efi || mount /efi
+mkdir -p /efi/EFI/zbm /efi/EFI/BOOT
+# Newest kernel that has a modules directory (ignores installkernel's *.old backups)
+kver=$(for d in /lib/modules/*; do v=${d##*/}; [ -e "/boot/vmlinuz-$v" ] && echo "$v"; done | sort -V | tail -n1)
+[ -n "$kver" ] || { echo "no installed kernel found in /boot" >&2; exit 1; }
+generate-zbm --kernel "/boot/vmlinuz-$kver" --kver "$kver" --prefix vmlinuz
+cp /efi/EFI/zbm/vmlinuz.EFI /efi/EFI/BOOT/BOOTX64.EFI
+echo "ZFSBootMenu built with kernel $kver: /efi/EFI/zbm/vmlinuz.EFI (copied to /efi/EFI/BOOT/BOOTX64.EFI)"
+# The hooks in /etc/zfsbootmenu/hooks (key injection) must be in the image; lsinitrd unpacks an EFI
+# image with objcopy. A missing hook does not stop the boot (the system then asks a second time).
+listing="$(lsinitrd /efi/EFI/zbm/vmlinuz.EFI 2>/dev/null)" || listing=""
+hooks="" missing=""
+for h in /etc/zfsbootmenu/hooks/*/*; do
+    [ -f "$h" ] && [ -x "$h" ] || continue
+    rel="${h#/etc/zfsbootmenu/hooks/}"; hooks="$hooks $rel"
+    printf '%s\n' "$listing" | grep -q "libexec/hooks/$rel\$" || missing="$missing $rel"
+done
+if [ -z "$hooks" ]; then
+    echo "ZFSBootMenu hooks: none in /etc/zfsbootmenu/hooks"
+elif [ -z "$listing" ]; then
+    echo "WARNING: could not list /efi/EFI/zbm/vmlinuz.EFI (lsinitrd) - hooks not checked:$hooks"
+elif [ -n "$missing" ]; then
+    echo "WARNING: hooks MISSING from the ZFSBootMenu image:$missing"
+else
+    echo "ZFSBootMenu hooks in the image:$hooks"
+fi

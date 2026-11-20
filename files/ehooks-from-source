@@ -1,0 +1,49 @@
+#!/bin/bash
+# ehooks-from-source - keep binary packages away from packages that must be built from source:
+#  * packages the gentoo-unity7 overlay patches while they build: its ehooks/<category>/<pkg>/
+#    has a hook for a src_* phase (a prebuilt binary package never runs those phases, so the
+#    patch would silently be missing; hooks for pkg_* phases also run for binary packages);
+#  * packages with local patches in /etc/portage/patches/<category>/<pkg>;
+#  * a few packages kept from install-unity.sh's first, hand-made list.
+# Writes /etc/portage/ehooks-from-source (one atom per line, never shrinks) and the
+# --usepkg-exclude block in /etc/portage/make.conf. Run by install-unity.sh and world-update;
+# safe to run any time. Without the overlay it only covers the local patches.
+# PORTAGE_CONFIGROOT and EHOOKS_REPO (the overlay's path) can be set for tests.
+set -Eeuo pipefail
+conf="${PORTAGE_CONFIGROOT:-}/etc/portage"
+list_file="$conf/ehooks-from-source"
+repo="${EHOOKS_REPO-$(portageq get_repo_path / gentoo-unity7 2>/dev/null || true)}"
+kept="app-accessibility/at-spi2-core:2 gnome-base/gsettings-desktop-schemas gnome-extra/polkit-gnome
+gui-libs/libadwaita:1 media-fonts/dejavu media-fonts/urw-fonts media-libs/fontconfig:1.0
+sys-apps/dbus www-client/firefox-bin:rapid x11-libs/gtk+:2 x11-libs/vte:2.91
+x11-themes/adwaita-icon-theme-legacy x11-terms/mate-terminal mate-extra/mate-utils
+app-editors/gnome-text-editor"
+
+overlay_src_hooks() {   # category/pkg[:slot] for every ehooks directory with a src_* phase hook
+    # (hooks are often symlinks to the overlay's templates, so files and links both count)
+    [ -n "$repo" ] && [ -d "$repo/ehooks" ] || return 0
+    find "$repo/ehooks" -mindepth 3 -maxdepth 3 ! -type d -name '*src_*.ehooks' \
+        | sed -e "s|^$repo/ehooks/||" -e 's|/[^/]*$||' \
+        | sed -E 's|^([^/]+)/(.+)-[0-9][^/:]*$|\1/\2|'    # mail-client/thunderbird-153 -> thunderbird
+}
+local_patches() {       # category/pkg with a directory in /etc/portage/patches
+    [ -d "$conf/patches" ] || return 0
+    find "$conf/patches" -mindepth 2 -maxdepth 2 -type d | sed "s|^$conf/patches/||"
+}
+
+mkdir -p "$conf"
+{ [ ! -f "$list_file" ] || cat "$list_file"
+  printf '%s\n' "$kept" | tr ' ' '\n'
+  overlay_src_hooks
+  local_patches; } | sed '/^$/d' | sort -u > "$list_file.new"
+mv "$list_file.new" "$list_file"
+excl="$(paste -sd' ' "$list_file")"
+touch "$conf/make.conf"
+sed -i '/^# >>> ehooks-from-source/,/^# <<< ehooks-from-source/d' "$conf/make.conf"
+cat >> "$conf/make.conf" <<EOF
+# >>> ehooks-from-source (managed by /usr/local/sbin/ehooks-from-source; list in $list_file)
+EMERGE_DEFAULT_OPTS="\${EMERGE_DEFAULT_OPTS} --usepkg-exclude '$excl'"
+# <<< ehooks-from-source
+EOF
+[ -n "$repo" ] || echo "no gentoo-unity7 overlay found - only local patches and the kept list"
+echo "always built from source ($(wc -l < "$list_file")): $excl"

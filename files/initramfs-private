@@ -1,0 +1,12 @@
+#!/bin/sh
+# /etc/kernel/postinst.d/90-initramfs-private - after every kernel install, makes its initramfs
+# readable by root only (deployed by ./deploy, group base). installkernel runs the files here with
+# the kernel version and the installed kernel image's path, after it has written the initramfs -
+# with mode 0644. The image used to carry the pool key; since key injection (files/zbm-key-injection)
+# it holds nothing secret, but stays root-only: a key put back by hand (dracut config) would be
+# readable by any user otherwise. ZFSBootMenu, dracut and lsinitrd run as root and are unaffected.
+# A failure is reported, never fatal to the kernel install.
+dir="$(dirname "$2")"
+chmod 600 "$dir/initramfs-$1.img" || echo "90-initramfs-private: could not make $dir/initramfs-$1.img root-only" >&2
+[ ! -e "$dir/initramfs-$1.img.old" ] || chmod 600 "$dir/initramfs-$1.img.old"
+exit 0

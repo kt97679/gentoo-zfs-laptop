@@ -1,0 +1,3 @@
+# /etc/udev/rules.d/90-battery-limits.rules (deployed by ./deploy): when a Thunderbolt device -
+# the dock - comes or goes, battery-limits sets the charge limits for the new place.
+ACTION=="add|remove", SUBSYSTEM=="thunderbolt", ENV{DEVTYPE}=="thunderbolt_device", RUN+="/usr/local/sbin/battery-limits udev"

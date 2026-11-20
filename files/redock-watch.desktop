@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Re-dock window restore
+Exec=/usr/local/bin/redock-watch
+OnlyShowIn=Unity;
+NoDisplay=true

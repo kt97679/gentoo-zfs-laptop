@@ -1,0 +1,33 @@
+# /etc/logrotate.d/emerge - rotation for Portage's two logs in /var/log, which no package rotates
+# (deployed by ./deploy, group base; Portage's own /etc/logrotate.d/elog-save-summary covers only
+# elog's summary.log). Portage makes either file again (portage:portage, 0660) when it is missing:
+# nocreate. The newest old copy stays uncompressed (delaycompress).
+#
+# emerge-fetch.log: with FEATURES=parallel-fetch (Portage's default) every emerge fetches the next
+# distfiles and binary packages in the background and appends wget's output here; nothing reads
+# it later. Monthly (the first daily run in a new month) or past 10 MB; 3 old logs kept.
+/var/log/emerge-fetch.log {
+    monthly
+    maxsize 10M
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+}
+
+# emerge.log: the merge history, about ten lines a merge; qlop and genlop read it (qlop -f FILE,
+# genlop -f FILE read an older copy). Yearly or past 10 MB; 5 old logs kept. world-update counts
+# a run's merges by their timestamps in emerge.log and in copies written during the run, so a
+# rotation in the middle of a run does not confuse it.
+/var/log/emerge.log {
+    yearly
+    maxsize 10M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+}
