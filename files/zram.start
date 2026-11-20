@@ -1,5 +1,12 @@
 #!/bin/sh
-# /etc/local.d/zram.start - compressed swap in RAM (size: the disksize line; deployed by ./deploy)
+# /etc/local.d/zram.start - compressed swap in RAM (size: the disksize line; deployed by ./deploy).
+# Not with a swap partition (the installer makes one under 16 GB of RAM): zswap.start puts a
+# compressed cache in front of that instead - zram and zswap together compress twice.
+SWAPS="${SWAPS:-/proc/swaps}"   # (tests point it elsewhere)
+if awk 'NR > 1 && $1 !~ "^/dev/zram" {f = 1} END {exit !f}' "$SWAPS"; then
+    echo "zram.start: a swap partition is in use - no zram (zswap.start)"
+    exit 0
+fi
 modprobe zram num_devices=1 || exit 1
 echo zstd > /sys/block/zram0/comp_algorithm
 echo 8G > /sys/block/zram0/disksize

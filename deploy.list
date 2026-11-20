@@ -12,6 +12,7 @@ base     0755  /etc/zfsbootmenu/hooks/load-key.d/50-key-injection               
 base     0755  /etc/zfsbootmenu/hooks/boot-sel.d/90-key-injection               files/zbm-key-injection
 base     0755  /etc/local.d/zram.start                                          files/zram.start
 base     0755  /etc/local.d/zram.stop                                           files/zram.stop
+base     0755  /etc/local.d/zswap.start                                         files/zswap.start
 base     0755  /etc/local.d/battery.start                                       files/battery.start
 base     0755  /usr/local/sbin/battery-limits                                   files/battery-limits
 base     0755  /etc/shadow-maint/useradd-post.d/50-zfs-home                     files/zfs-home

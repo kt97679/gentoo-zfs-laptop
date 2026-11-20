@@ -37,8 +37,14 @@ laptops should work - CPU level and graphics drivers are detected - but have not
   binary host, GitHub (the Unity overlay), the vendors of some listed apps (Chrome, Zoom) and,
   later, ghcr.io (the Tribler image, if you keep it). The install stops at the first failed
   download.
-- **Memory:** tuned for 32 GB or more. On a smaller machine lower `ARC_MAX_GIB` (the ZFS read
-  cache, default 8) at the top of `install-gentoo.sh`; about a quarter of the RAM is reasonable.
+- **Memory:** 4 GB and up; the installer sizes things from the RAM. The ZFS read cache gets a
+  quarter of it (1 to 8 GiB), builds one job per 2 GB. From 16 GB: compressed swap in RAM (zram),
+  no swap partition. Under 16 GB: a swap partition of twice the RAM (at most 16 GiB) between the
+  EFI partition and ZFS, encrypted with a new random key at each boot, with zswap (a compressed
+  cache in RAM) in front of it - the install itself swaps there too. `SWAP_GIB` and `ARC_MAX_GIB`
+  in the *Settings* block (or the environment) override this; `SWAP_GIB=0` means no partition. On
+  4 GB it works but is slow: what is built from source (the desktop, webkit-gtk) takes hours, and a
+  browser with many tabs swaps.
 - **Time:** roughly 30-60 minutes for the base system and 1-2 hours for the desktop.
 - **Known issue - ThinkPad T14/P14s Gen 5 AMD:** on early BIOS versions sleep draws about 7 W
   (the embedded controller wakes the chip every second). BIOS 1.05 had it, 1.23 does not: update
@@ -99,13 +105,15 @@ laptops should work - CPU level and graphics drivers are detected - but have not
 
    It shows a menu of disks, then asks for the host name, user name and time zone (a menu;
    *Other* lets you type any zone). Next it shows a summary - host, user, time zone, CPU level,
-   graphics drivers, disk - check it and type `YES`. Then the pool passphrase twice and your user
+   graphics drivers, the memory plan (swap, ZFS cache, build jobs), disk - check it and type
+   `YES`. Then the pool passphrase twice and your user
    password twice. After that it runs on its own and ends with **Done** and a list of next steps.
 
    You can give the answers up front instead, e.g.
    `HOSTNAME_NEW=mylaptop USERNAME=alice TIMEZONE=Europe/Berlin bash install-gentoo.sh`. Also
-   recognised: `DISK=/dev/disk/by-id/...` (skips the menu), `BINHOST_ARCH=x86-64` and
-   `VIDEO_CARDS=...` (override the detection).
+   recognised: `DISK=/dev/disk/by-id/...` (skips the menu), `BINHOST_ARCH=x86-64`,
+   `VIDEO_CARDS=...` (override the detection), `SWAP_GIB=...` and `ARC_MAX_GIB=...` (override the
+   memory plan).
 
    The log is `/root/install-gentoo.log` (also copied into the new system's `/root`). If something
    went wrong, the lines that matter are:
@@ -252,8 +260,9 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
 
 ## What else it sets up
 
-So that nothing surprises you: compressed swap in RAM (zram) and no swap partition; the ZFS read
-cache capped (`ARC_MAX_GIB`); a soft memory cap on each desktop session, 5/8 of RAM (systemd's
+So that nothing surprises you: compressed swap in RAM (zram) and no swap partition - under 16 GB
+of RAM instead an encrypted swap partition with zswap (its key is new at each boot, so there is no
+hibernation); the ZFS read cache capped (`ARC_MAX_GIB`); a soft memory cap on each desktop session, 5/8 of RAM (systemd's
 `MemoryHigh` without systemd; `MEMORY_HIGH=` in `/etc/session-memory-limit.conf` changes it); network settings so that a dock's Ethernet and the Wi-Fi can be on
 the same network at once without NetworkManager dropping both addresses; a small helper that puts
 windows back where they were when you re-dock; container images (with Podman) in

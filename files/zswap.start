@@ -1,0 +1,19 @@
+#!/bin/sh
+# /etc/local.d/zswap.start - zswap, a compressed cache in RAM in front of a swap partition (deployed
+# by ./deploy). Only when a swap partition is in use - the encrypted one the installer makes under
+# 16 GB of RAM (dmcrypt service, /etc/conf.d/dmcrypt); without one, zram.start sets up compressed
+# swap in RAM instead. Pages leaving RAM are compressed first (zstd, zsmalloc); the pool takes up to
+# 25 % of RAM, and its shrinker moves pages nobody touches on to the partition.
+# Its state: grep -r . /sys/module/zswap/parameters
+SWAPS="${SWAPS:-/proc/swaps}" P="${ZSWAP_PARAMS:-/sys/module/zswap/parameters}"   # (tests)
+awk 'NR > 1 && $1 !~ "^/dev/zram" {f = 1} END {exit !f}' "$SWAPS" || exit 0
+if [ ! -w "$P/enabled" ]; then
+    echo "zswap.start: this kernel has no zswap - the swap partition works without it" >&2
+    exit 0
+fi
+echo zstd > "$P/compressor" 2>/dev/null || echo "zswap.start: zstd refused, keeping $(cat "$P/compressor")" >&2
+[ ! -e "$P/zpool" ] || echo zsmalloc > "$P/zpool"   # gone in 6.18: zsmalloc is the only allocator
+echo 25 > "$P/max_pool_percent"
+[ ! -e "$P/shrinker_enabled" ] || echo Y > "$P/shrinker_enabled"
+echo Y > "$P/enabled"
+echo "zswap.start: zswap on ($(cat "$P/compressor"), up to 25 % of RAM)"

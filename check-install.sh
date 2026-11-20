@@ -48,6 +48,7 @@ else
     we_imported=1
 fi
 zpool status -P "$POOL" | grep -E 'state:|/dev/|errors:'
+vdev="$(zpool status -P "$POOL" | awk '/\/dev\// {print $1; exit}')"   # the pool's partition
 zpool get -H -o property,value bootfs,compatibility,autotrim,ashift "$POOL"
 zfs get -H -o name,property,value org.zfsbootmenu:commandline "$POOL/ROOT"
 zfs get -H -o name,property,value keylocation,gentoo-laptop:key-injection "$POOL"   # want prompt, on
@@ -75,6 +76,20 @@ for f in /etc/fstab /etc/dracut.conf.d/zfs.conf /etc/modprobe.d/zfs.conf \
          /etc/zfsbootmenu/config.yaml /etc/sudoers.d/wheel /etc/conf.d/hostname; do
     printf -- '--- %s\n' "$f"; grep -v '^[[:space:]]*#' "$MNT$f" | grep -v '^[[:space:]]*$'
 done
+
+sec "Swap"
+disk="$(sed -E 's/(-part|p)?[0-9]+$//' <<<"$vdev")"
+[ -b "$disk" ] || disk="$(sed -E 's/[0-9]+$//' <<<"$vdev")"
+sgdisk -p "$disk" 2>/dev/null | sed -n '/^Number/,$p'
+if grep -q '^swap=' "$MNT/etc/conf.d/dmcrypt" 2>/dev/null; then
+    printf -- '--- %s\n' /etc/conf.d/dmcrypt; grep -E '^(swap|source|options)=' "$MNT/etc/conf.d/dmcrypt"
+    u="$(sed -n "s/^source='PARTUUID=\(.*\)'$/\1/p" "$MNT/etc/conf.d/dmcrypt")"
+    if d="$(blkid -l -t "PARTUUID=$u" -o device)"; then echo "PARTUUID $u is $d"; else echo ">>> PARTUUID $u: no such partition"; fi
+    grep -q '^/dev/mapper/crypt-swap[[:space:]]' "$MNT/etc/fstab" || echo ">>> no crypt-swap line in /etc/fstab"
+    [ -e "$MNT/etc/runlevels/boot/dmcrypt" ] || echo ">>> dmcrypt is not in the boot runlevel"
+else
+    echo "no swap partition: compressed swap in RAM (zram.start)"
+fi
 
 sec "Services enabled at boot"
 for rl in boot default; do
@@ -120,8 +135,7 @@ if [ -r "$MNT/etc/cron.d/sanoid-snapshots" ]; then grep -v '^#' "$MNT/etc/cron.d
 else echo "/etc/cron.d/sanoid-snapshots: missing"; fi
 
 sec "EFI system partition"
-vdev="$(zpool status -P "$POOL" | awk '/\/dev\// {print $1; exit}')"
-esp="${vdev%-part2}-part1"; [ "$esp" = "$vdev-part1" ] && esp="${vdev%2}1"
+esp="$(sed -E 's/[0-9]+$/1/' <<<"$vdev")"   # ZFS is partition 2, or 3 after a swap partition
 espdir="$(findmnt -n -o TARGET --source "$(readlink -f "$esp")" | head -n1)"
 if [ -z "$espdir" ]; then
     mkdir -p "$ESPMNT" && mount -o ro "$esp" "$ESPMNT" && we_mounted_esp=1 && espdir="$ESPMNT"

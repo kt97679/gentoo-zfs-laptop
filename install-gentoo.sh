@@ -13,11 +13,13 @@
 #
 # Layout:  $DISK-part1  1 GiB EFI system partition  -> /efi
 #          $DISK-part2  rest of disk                -> ZFS pool "$POOL"
+#   under 16 GB of RAM (SWAP_GIB below) a swap partition comes between them, and ZFS is part3:
+#          $DISK-part2  swap, encrypted with a new random key at each boot, zswap in front of it
 #   gentoo                 aes-256-gcm, passphrase (one encryption root, one prompt)
 #   gentoo/ROOT/default    /               boot environment, kernels in its /boot
 #   gentoo/home/<user>     /home/<user>
 #   gentoo/scratch         /var/tmp        (exclude from snapshots/replication later)
-#   swap: zram (no swap on ZFS)
+#   swap: zram (never swap on ZFS); with a swap partition zswap instead
 
 set -Eeuo pipefail
 
@@ -39,7 +41,12 @@ LOCALE="${LOCALE:-en_US.UTF-8}"
 BINHOST_ARCH="${BINHOST_ARCH:-}"  # empty: x86-64-v3 if this CPU supports it, else x86-64
 VIDEO_CARDS="${VIDEO_CARDS-auto}" # auto: from the graphics hardware found (AMD: amdgpu radeonsi,
                                   # Intel: intel, NVIDIA: nouveau); empty: the profile's default
-ARC_MAX_GIB=8                     # cap the ZFS read cache (default is ~all RAM on 2.3+)
+ARC_MAX_GIB="${ARC_MAX_GIB:-auto}" # cap of the ZFS read cache in GiB (ZFS's own default is ~all
+                                  # RAM); auto: a quarter of the RAM, 1 to 8
+SWAP_GIB="${SWAP_GIB:-auto}"       # swap partition in GiB, encrypted with a new random key at each
+                                  # boot, with zswap in front of it; auto: under 16 GB of RAM twice
+                                  # the RAM (at most 16), else none - compressed swap in RAM (zram)
+                                  # does then; 0: none
 ESP_SIZE="1G"
 MIRROR="https://distfiles.gentoo.org"
 TARGET="/mnt/gentoo"
@@ -51,6 +58,25 @@ step() { printf '\n\033[1;32m>>> %s\033[0m\n' "$*"; }
 HERE="$(dirname "$(readlink -f "$0")")"   # the checkout: its system files are deployed in the chroot
 [ -x "$HERE/deploy" ] && [ -f "$HERE/deploy.list" ] && [ -d "$HERE/files" ] \
     || die "run this from the gentoo-laptop checkout: deploy, deploy.list and files/ must be next to it"
+memory_plan() {   # memory_plan MEMTOTAL_KB THREADS - prints "RAM ARC SWAP JOBS": the RAM's nominal
+    # size in GB (MemTotal up to a multiple of 4: firmware and integrated graphics keep part of it,
+    # so a 16 GB laptop reports 13-15 GiB), the ZFS cache cap and the swap partition in GiB, and
+    # make jobs (one per 2 GB of RAM, at most one per thread)
+    local kb="$1" threads="$2" ram arc swap jobs
+    ram=$(( (kb + 4194303) / 4194304 ))   # whole units of 4 GiB, rounded up
+    ram=$(( ram * 4 ))
+    if [ "$ARC_MAX_GIB" = auto ]; then
+        arc=$(( ram / 4 )); [ "$arc" -ge 1 ] || arc=1; [ "$arc" -le 8 ] || arc=8
+    else
+        arc="$ARC_MAX_GIB"
+    fi
+    if [ "$SWAP_GIB" != auto ]; then swap="$SWAP_GIB"
+    elif [ "$ram" -lt 16 ]; then swap=$(( ram * 2 )); [ "$swap" -le 16 ] || swap=16
+    else swap=0; fi
+    jobs=$(( ram / 2 )); [ "$jobs" -ge 1 ] || jobs=1; [ "$jobs" -le "$threads" ] || jobs="$threads"
+    echo "$ram $arc $swap $jobs"
+}
+
 part() {  # partition path for partition number $1
     case "$DISK" in
         /dev/disk/by-id/*|/dev/disk/by-path/*) echo "${DISK}-part$1" ;;
@@ -212,10 +238,16 @@ ask USERNAME "Your user name" '^[a-z_][a-z0-9_-]{0,31}$' "alice"
 # /usr/share/zoneinfo, so checking here rejected every zone.
 [ -n "$BINHOST_ARCH" ] || BINHOST_ARCH="$(detect_binhost_arch)"
 [ "$VIDEO_CARDS" != auto ] || VIDEO_CARDS="$(detect_video_cards)"
+[[ "$ARC_MAX_GIB" =~ ^(auto|[1-9][0-9]*)$ ]] || die "ARC_MAX_GIB=\"$ARC_MAX_GIB\": a whole number of GiB, or auto"
+[[ "$SWAP_GIB" =~ ^(auto|0|[1-9][0-9]*)$ ]] || die "SWAP_GIB=\"$SWAP_GIB\": a whole number of GiB (0: none), or auto"
+read -r RAM_GB ARC_GIB SWAP_N BUILD_JOBS < <(memory_plan "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" "$(nproc)")
 
 zfs version
 echo; echo "Host $HOSTNAME_NEW, user $USERNAME, time zone $TIMEZONE, locale $LOCALE"
 echo "Binary packages for $BINHOST_ARCH; VIDEO_CARDS: ${VIDEO_CARDS:-(profile default)}"
+if [ "$SWAP_N" -gt 0 ]; then swap_word="a $SWAP_N GiB encrypted swap partition with zswap"
+else swap_word="compressed swap in RAM (zram), no swap partition"; fi
+echo "RAM ${RAM_GB} GB: $swap_word; ZFS cache up to $ARC_GIB GiB; $BUILD_JOBS build jobs"
 echo "Selected: $DISK"
 lsblk -o NAME,SIZE,TRAN,MODEL,SERIAL,FSTYPE "$DISK"
 read -rp "Type YES to ERASE $DISK and install Gentoo: " answer
@@ -236,17 +268,61 @@ exec > >(tee -a "$LOG") 2>&1
 echo "Install started $(date -Is), disk $DISK"
 
 ### Partitioning ################################################################
+partition_disk() {   # EFI, then the swap partition if SWAP_N > 0, then ZFS; sets ESP, SWAPPART,
+    # ZPART and SWAP_PARTUUID (lower case, as blkid gives it; empty without swap)
+    SWAPPART="" SWAP_PARTUUID=""
+    if [ "$SWAP_N" -gt 0 ]; then
+        sgdisk -n1:1M:+"$ESP_SIZE" -t1:EF00 -c1:EFI \
+               -n2:0:+"${SWAP_N}G" -t2:8200 -c2:swap \
+               -n3:0:0             -t3:BF00 -c3:zfs "$DISK"
+    else
+        sgdisk -n1:1M:+"$ESP_SIZE" -t1:EF00 -c1:EFI \
+               -n2:0:0             -t2:BF00 -c2:zfs "$DISK"
+    fi
+    partprobe "$DISK" 2>/dev/null || true
+    udevadm settle; sleep 2
+    ESP="$(part 1)"
+    if [ "$SWAP_N" -gt 0 ]; then
+        SWAPPART="$(part 2)" ZPART="$(part 3)"
+        [ -b "$SWAPPART" ] || die "partition $SWAPPART did not appear"
+        wipefs -aq "$SWAPPART"   # no old signature in it; the swap is made at boot, encrypted
+        SWAP_PARTUUID="$(sgdisk -i 2 "$DISK" | sed -n 's/^Partition unique GUID: //p' | tr 'A-F' 'a-f')"
+        [[ "$SWAP_PARTUUID" =~ ^[0-9a-f-]{36}$ ]] || die "no partition GUID for $SWAPPART: '$SWAP_PARTUUID'"
+    else
+        ZPART="$(part 2)"
+    fi
+    [ -b "$ESP" ] && [ -b "$ZPART" ] || die "partitions $ESP / $ZPART did not appear"
+}
+INSTALL_SWAP=install-swap
+live_swap() {   # live_swap on|off - the swap partition as swap for the install itself (a small
+    # machine's builds need it): a throwaway random key, the cipher the system uses at boot; gone at
+    # reboot, when the installed system opens the partition with a key of its own. off: before the
+    # disk is wiped again (a rerun) - a partition in use keeps the old partition table.
+    case "$1" in
+    on)
+        command -v cryptsetup >/dev/null || { echo "no cryptsetup in this live system - the install runs without swap"; return 0; }
+        if cryptsetup open --type plain --batch-mode -c aes-xts-plain64 -s 512 -d /dev/urandom "$SWAPPART" "$INSTALL_SWAP" \
+            && mkswap "/dev/mapper/$INSTALL_SWAP" >/dev/null && swapon "/dev/mapper/$INSTALL_SWAP"; then
+            echo "swap for the install: $SWAP_N GiB on $SWAPPART, encrypted with a throwaway key"
+        else
+            echo "could not use $SWAPPART as swap - the install runs without swap"
+        fi
+        ;;
+    off)
+        [ -e "/dev/mapper/$INSTALL_SWAP" ] || return 0
+        swapoff "/dev/mapper/$INSTALL_SWAP" 2>/dev/null || true
+        cryptsetup close "$INSTALL_SWAP" || die "the swap of an earlier run (/dev/mapper/$INSTALL_SWAP) is still in use"
+        ;;
+    esac
+}
 step "Wiping and partitioning $DISK"
+live_swap off   # a rerun: the swap of the first run is on the disk about to be wiped
 for p in "$DISK"*; do [ -b "$p" ] && zpool labelclear -f "$p" 2>/dev/null || true; done
 wipefs -af "$DISK"
 sgdisk --zap-all "$DISK"
-sgdisk -n1:1M:+"$ESP_SIZE" -t1:EF00 -c1:EFI \
-       -n2:0:0             -t2:BF00 -c2:zfs "$DISK"
-partprobe "$DISK" 2>/dev/null || true
-udevadm settle; sleep 2
-ESP="$(part 1)"; ZPART="$(part 2)"
-[ -b "$ESP" ] && [ -b "$ZPART" ] || die "partitions $ESP / $ZPART did not appear"
+partition_disk
 mkfs.vfat -F32 -n EFI "$ESP"
+[ -z "$SWAPPART" ] || live_swap on
 
 ### Pool and datasets ###########################################################
 copy_live_ssh() {   # into $TARGET: the live session's SSH login key and the host keys it made
@@ -269,6 +345,31 @@ copy_live_ssh() {   # into $TARGET: the live session's SSH login key and the hos
     echo "SSH: $n host key(s) from the live session$([ "$n" -gt 0 ] || echo ' (none made by it) - new ones at first start')"
 }
 
+swap_setup() {   # in $TARGET: the swap partition SWAP_PARTUUID, opened at boot by the dmcrypt service
+    # (sys-fs/cryptsetup, boot runlevel) with a new random key, made a swap there and used through
+    # fstab; zswap.start (files/) puts zswap in front of it. Appended after the package wrote its
+    # /etc/conf.d/dmcrypt. A random key: nothing survives a reboot - no hibernation. The source as a
+    # tag, as that file advises: the service then finds the partition with blkid, waiting up to 5 s
+    # for it, and needs no /dev/disk/by-partuuid link from udev. --batch-mode: cryptsetup asks to
+    # type YES when it sees an old signature on the partition (one wipefs missed, or ciphertext that
+    # happens to look like one), and the boot would wait at that prompt; the partition is this
+    # one by its GUID, and the service itself refuses a LUKS partition.
+    local conf="$TARGET/etc/conf.d/dmcrypt"
+    [ -f "$conf" ] || die "$conf is missing - sys-fs/cryptsetup did not install"
+    if ! grep -q '^swap=crypt-swap$' "$conf"; then
+        cat >> "$conf" <<EOF
+
+# gentoo-laptop (install-gentoo.sh): the swap partition, opened with a new random key at each boot
+swap=crypt-swap
+source='PARTUUID=$SWAP_PARTUUID'
+options='--batch-mode -c aes-xts-plain64 -s 512 -d /dev/urandom'
+EOF
+    fi
+    grep -q '^/dev/mapper/crypt-swap[[:space:]]' "$TARGET/etc/fstab" \
+        || echo "/dev/mapper/crypt-swap  none  swap  sw,pri=10  0 0" >> "$TARGET/etc/fstab"
+    echo "swap: $SWAP_N GiB partition (PARTUUID $SWAP_PARTUUID), a new random key at each boot, zswap in front"
+}
+
 step "Creating hostid and encrypted pool"
 zgenhostid -f
 mkdir -p /etc/zfs
@@ -284,6 +385,10 @@ printf '%s' "$PASSPHRASE" | zpool create -f \
     -O mountpoint=none -O canmount=off \
     -R "$TARGET" "$POOL" "$ZPART"
 unset PASSPHRASE
+# The live system's ZFS cache capped as the installed system's will be: by default it may take
+# nearly all of the RAM, and on a small machine the install's builds need it.
+echo "$((ARC_GIB * 1024 * 1024 * 1024))" > /sys/module/zfs/parameters/zfs_arc_max 2>/dev/null \
+    || echo "(the live system's ZFS cache left as it is)"
 
 zfs create -o mountpoint=none -o canmount=off "$POOL/ROOT"
 zfs create -o mountpoint=/ -o canmount=noauto "$POOL/ROOT/default"
@@ -335,7 +440,7 @@ CFLAGS="\${COMMON_FLAGS}"
 CXXFLAGS="\${COMMON_FLAGS}"
 FCFLAGS="\${COMMON_FLAGS}"
 FFLAGS="\${COMMON_FLAGS}"
-MAKEOPTS="-j$(nproc) -l$(nproc)"
+MAKEOPTS="-j$BUILD_JOBS -l$(nproc)"
 FEATURES="\${FEATURES} getbinpkg binpkg-request-signature"
 USE="dist-kernel"
 ACCEPT_LICENSE="-* @FREE @BINARY-REDISTRIBUTABLE"
@@ -388,7 +493,7 @@ echo "net-libs/webkit-gtk fewer-jobs.conf" | portage_conf package.env heavy-buil
 # pool key (ZFSBootMenu brings it at boot, in RAM).
 mkdir -p "$TARGET/etc/dracut.conf.d" "$TARGET/etc/modprobe.d"
 # (dracut config: files/dracut-zfs.conf, deployed in the chroot)
-echo "options zfs zfs_arc_max=$((ARC_MAX_GIB * 1024 * 1024 * 1024))" > "$TARGET/etc/modprobe.d/zfs.conf"
+echo "options zfs zfs_arc_max=$((ARC_GIB * 1024 * 1024 * 1024))" > "$TARGET/etc/modprobe.d/zfs.conf"
 
 # zram swap, the daily sync, the ARP settings, battery limits, update-zbm, world-update and the other
 # system files of this project come from the checkout: deploy.list (group base), installed by
@@ -423,7 +528,7 @@ mount --bind /run "$TARGET/run";   mount --make-slave "$TARGET/run"
 chroot "$TARGET" /usr/bin/env -i \
     HOME=/root TERM="${TERM:-xterm}" PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     POOL="$POOL" USERNAME="$USERNAME" LOCALE="$LOCALE" \
-    DISK_DEV="$(readlink -f "$DISK")" \
+    DISK_DEV="$(readlink -f "$DISK")" SWAP_PARTUUID="$SWAP_PARTUUID" \
     /bin/bash -s <<'CHROOT'
 set -Eeuo pipefail
 trap 'echo "FAILED (chroot) at line $LINENO: $BASH_COMMAND" >&2' ERR
@@ -457,7 +562,8 @@ emerge --quiet-build=y --noreplace \
     app-editors/vim app-portage/gentoolkit dev-vcs/git app-misc/tmux \
     net-vpn/tor net-analyzer/nmap net-analyzer/tcpdump app-misc/byobu \
     app-shells/bash-completion sys-process/lsof sys-process/htop sys-process/atop sys-apps/pciutils \
-    sys-apps/lshw app-admin/logrotate sys-apps/bolt sys-fs/sanoid sys-apps/fwupd
+    sys-apps/lshw app-admin/logrotate sys-apps/bolt sys-fs/sanoid sys-apps/fwupd \
+    ${SWAP_PARTUUID:+sys-fs/cryptsetup}   # the swap partition's encryption (dmcrypt service)
 
 step "System files of this project (deploy, group base)"
 # After the packages, so sanoid.conf and ZFSBootMenu's config.yaml replace the packages' examples
@@ -511,6 +617,7 @@ add sysklogd default
 add chronyd default
 add boltd default          # Thunderbolt/USB4 device authorization (docks)
 add atop default           # every process once a minute, 28 days (files/atop.default)
+[ -z "$SWAP_PARTUUID" ] || add dmcrypt boot   # the swap partition, opened with a random key
 
 step "Creating user $USERNAME"
 if ! id "$USERNAME" >/dev/null 2>&1; then
@@ -585,6 +692,10 @@ efibootmgr
 CHROOT
 
 rm -rf "$TARGET/tmp/gentoo-laptop"   # the copy of deploy used in the chroot
+if [ -n "$SWAP_PARTUUID" ]; then
+    step "Encrypted swap partition"
+    swap_setup
+fi
 
 step "This checkout in $USERNAME's home (for install-unity.sh and later ./deploy)"
 if [ -e "$TARGET/home/$USERNAME/gentoo-laptop" ]; then
