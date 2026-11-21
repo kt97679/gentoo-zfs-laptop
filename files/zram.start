@@ -1,14 +1,39 @@
 #!/bin/sh
-# /etc/local.d/zram.start - compressed swap in RAM (size: the disksize line; deployed by ./deploy).
+# /etc/local.d/zram.start - compressed swap in RAM, sized at ZRAM_PERCENT of the RAM and compressed
+# with ZRAM_COMPRESSOR (settings of this machine in local.conf; deployed by ./deploy). The size is
+# a ceiling on what zram may hold, uncompressed, not a reservation: zram takes RAM only for what it
+# stores, compressed (zstd: about a third), plus a table allocated up front, about half a percent
+# of the size. Half of the RAM by default (user, 11-21): VMs past the RAM get compressed instead of
+# killed; the price is that a runaway program grows longer before the kernel kills it.
 # Not with a swap partition (the installer makes one under 16 GB of RAM): zswap.start puts a
 # compressed cache in front of that instead - zram and zswap together compress twice.
-SWAPS="${SWAPS:-/proc/swaps}"   # (tests point it elsewhere)
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+PERCENT=$(local_setting ZRAM_PERCENT '50' '[1-9]|[1-9][0-9]|100')
+ALGO=$(local_setting ZRAM_COMPRESSOR 'zstd' '[a-z0-9-]+')
+SWAPS="${SWAPS:-/proc/swaps}" MEMINFO="${MEMINFO:-/proc/meminfo}"            # (tests point these
+SYS="${ZRAM_SYS:-/sys/block/zram0}" DEV="${ZRAM_DEV:-/dev/zram0}"            #  elsewhere)
 if awk 'NR > 1 && $1 !~ "^/dev/zram" {f = 1} END {exit !f}' "$SWAPS"; then
     echo "zram.start: a swap partition is in use - no zram (zswap.start)"
     exit 0
 fi
+kb=$(awk '/^MemTotal:/ {print $2}' "$MEMINFO")
+case "$kb" in ''|*[!0-9]*) echo "zram.start: no MemTotal in $MEMINFO - no zram" >&2; exit 1 ;; esac
+bytes=$(( kb * 1024 * PERCENT / 100 ))
 modprobe zram num_devices=1 || exit 1
-echo zstd > /sys/block/zram0/comp_algorithm
-echo 8G > /sys/block/zram0/disksize
-mkswap -L zram0 /dev/zram0 >/dev/null
-swapon -p 100 /dev/zram0
+echo "$ALGO" > "$SYS/comp_algorithm" 2>/dev/null \
+    || echo "zram.start: the kernel refused $ALGO as zram's compressor - its default instead ($(cat "$SYS/comp_algorithm"))" >&2
+echo "$bytes" > "$SYS/disksize"
+mkswap -L zram0 "$DEV" >/dev/null
+swapon -p 100 "$DEV"
+echo "zram.start: compressed swap in RAM, up to $(awk -v b="$bytes" 'BEGIN {printf "%.1f", b / 2^30}') GiB ($PERCENT % of the RAM)"

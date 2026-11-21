@@ -1,0 +1,113 @@
+# local.conf.example - the settings of one machine, each with its default and what it does.
+#
+# How to use it
+#   cd ~/gentoo-laptop
+#   cp local.conf.example local.conf     once; git ignores local.conf, so updates never touch it
+#   (edit local.conf: remove the "#" in front of a setting and change its value)
+#   sudo ./deploy                        shows the change, asks, and installs it as
+#                                        /etc/gentoo-laptop/local.conf, where the scripts read it
+# Then do what "Takes effect" says in the setting's section. To go back to a default, put the "#"
+# back (or delete the line) and deploy again. Deleting local.conf and deploying removes the
+# installed copy, and every setting is at its default again.
+#
+# The format
+#   One setting per line: NAME=VALUE - no spaces around "=", no quotes, no spaces in the value.
+#   A comment may follow the value after a space:    ZRAM_PERCENT=40   # less for this machine
+#   Lines starting with "#" and empty lines are ignored. A name set twice: the last line counts.
+#   An empty value (NAME=) means the default.
+# deploy checks every line before it installs anything: a name it does not know (a typo) or a
+# value of the wrong form stops it, with the line number. The allowed values come from the scripts
+# themselves, so this file and the scripts cannot disagree. A script that still finds a bad value
+# (local.conf edited in /etc by hand) says so and uses the default.
+#
+# Each machine keeps its own local.conf, so two laptops can differ. It lives in your home, so the
+# home's snapshots and backups keep it. install-gentoo.sh takes it too when you put one in the
+# folder you run it from: the new system then starts with these settings.
+
+# --- Battery charge limits (ThinkPad: /usr/local/sbin/battery-limits) -----------------------------
+# The firmware stops charging at the END value and starts again only once the battery is below the
+# START value. On the dock (any Thunderbolt device connected) the dock limits apply: a laptop that
+# lives plugged in ages more slowly kept below full. Away from the dock, and after
+# "sudo battery-limits full" (before a trip), the away limits apply. START must be below END:
+# otherwise that pair falls back to its defaults, and battery-limits says so. Set both of a pair
+# when you change one. Laptops without these firmware controls ignore all four.
+# Takes effect: at once with "sudo battery-limits"; it also runs at each boot, dock and undock.
+# "battery-limits status" shows the place, the limits in force and the battery.
+# Docked: charging starts again when the battery is below this, in percent (0-99).
+#BATTERY_DOCK_START=75
+# Docked: charging stops at this, in percent (1-100).
+#BATTERY_DOCK_END=80
+# Away from the dock: charging starts again below this (0-99); 99 tops the battery up almost always.
+#BATTERY_AWAY_START=99
+# Away from the dock: charging stops at this (1-100); 100 is a full battery.
+#BATTERY_AWAY_END=100
+
+# --- Compressed swap in RAM (zram: /etc/local.d/zram.start) ---------------------------------------
+# With 16 GB of RAM or more, memory nobody has touched for a while is compressed into zram, in RAM,
+# instead of being written to a disk. (Under 16 GB the installer makes an encrypted swap partition
+# with zswap in front of it instead - the ZSWAP_ settings below; zram is then not used at all.)
+# Takes effect: at the next boot. Or now, when memory is not tight - this moves what zram holds
+# back into RAM first:  sudo /etc/local.d/zram.stop && sudo /etc/local.d/zram.start
+# "zramctl" shows the size (DISKSIZE), what it holds (DATA) and what that takes in RAM (TOTAL).
+# How much zram may hold, uncompressed, in percent of the RAM (1-100). This is a ceiling, not a
+# reservation: zram takes RAM only for what it holds, compressed to about a third, plus a table of
+# about half a percent of the size. More lets virtual machines and other big workloads go past the
+# RAM without being killed; the cost is that a runaway program also takes longer to be stopped.
+#ZRAM_PERCENT=50
+# The compression: zstd packs tightest; lz4 is faster and packs less; lzo-rle is the kernel's own
+# default. "cat /sys/block/zram0/comp_algorithm" lists what this kernel offers (the one in use in
+# brackets). One it does not offer leaves the kernel's default, and zram.start says so at boot.
+#ZRAM_COMPRESSOR=zstd
+
+# --- Compressed cache before a swap partition (zswap: /etc/local.d/zswap.start) -------------------
+# Only on a machine with a swap partition - the installer makes one under 16 GB of RAM; elsewhere
+# these do nothing. Memory on its way to the partition is compressed and kept in RAM first; what
+# nobody touches then moves on to the partition.
+# Takes effect: at the next boot, or now with:  sudo /etc/local.d/zswap.start
+# "grep -r . /sys/module/zswap/parameters" shows zswap's state.
+# The compression, as for zram: zstd (tightest), lz4 (faster, packs less), lzo (the kernel's
+# default). One the kernel does not offer keeps the one in use, and zswap.start says so.
+#ZSWAP_COMPRESSOR=zstd
+# The most of the RAM zswap may fill with compressed memory, in percent (1-100). Past it, the
+# oldest of it goes to the swap partition.
+#ZSWAP_POOL_PERCENT=25
+
+# --- Process history (atop: /etc/default/atop) -----------------------------------------------------
+# atop records every process - CPU, memory, disk - so that after the desktop stalled you can see
+# which program it was:  atop -r /var/log/atop/atop_YYYYMMDD -b HH:MM
+# Takes effect: with the next day's file (at midnight), or now with:  sudo rc-service atop restart
+# Seconds between two samples (1 or more). Shorter catches briefer episodes and takes more disk:
+# every 60 s is about 13 MiB a day at 450 processes.
+#ATOP_INTERVAL=60
+# Days of history kept (1 or more): one file a day in /var/log/atop; older ones are deleted at
+# midnight.
+#ATOP_DAYS=28
+
+# --- Windows back in place after re-docking (redock-watch, in the desktop session) ----------------
+# After an undock it moves windows from the vanished monitors onto the laptop's screen, and after a
+# re-dock it puts them back where they were.
+# Takes effect: at the next login.
+# Seconds without window changes before it notes where every window is (decimals allowed: 0.5).
+#REDOCK_QUIET=1
+# Seconds after the last monitor change before it acts on an undock or a re-dock (decimals
+# allowed). Raise it - try 0.5 to 2 - if windows land in the wrong place because the monitors were
+# still settling.
+#REDOCK_SETTLE=1
+
+# --- Memory cap of the desktop session (session-memory-limit, at login) ---------------------------
+# Everything started from the desktop shares one soft cap: past it, the session is slowed down and
+# its memory pushed into compressed swap, instead of the whole machine stalling. A text console
+# (Ctrl+Alt+F2) and SSH logins are outside it and stay quick. Nothing is killed.
+# Takes effect: at the next login.
+# The cap, in one of three forms: a share of the RAM, 1 to 100 % with decimals allowed (50%,
+# 62.5%); a size with its unit K, M, G or T (24G - a bare number would be bytes, so it is refused);
+# or max for no cap at all. Empty (the default): 62.5%, 5/8 of the RAM - 20 GiB with 32 GB. Wins
+# over MEMORY_HIGH in /etc/session-memory-limit.conf, the older place for this.
+#SESSION_MEMORY_HIGH=
+
+# --- Not here ------------------------------------------------------------------------------------
+# Whole configuration files are still changed in files/ and deployed: the snapshot schedule
+# (files/sanoid.conf), SSH (files/sshd-keys-only.conf), ZFSBootMenu (files/zfsbootmenu-config.yaml)
+# and the initramfs (files/dracut-zfs.conf). The ZFS read cache is set once by the installer, in
+# /etc/modprobe.d/zfs.conf; the build jobs in /etc/portage/make.conf. Before an install,
+# install-gentoo.sh's own settings (disk, swap partition, cache size) are at its top.

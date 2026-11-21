@@ -24,6 +24,7 @@ laptops should work - CPU level and graphics drivers are detected - but have not
 | `unity-apps.list` | the applications `install-unity.sh` adds - edit it to taste |
 | `deploy`, `deploy.list` | install the system files from `files/` as root-owned copies; both installers use it, and you use it after changing a file |
 | `files/` | those system files: update and snapshot tools, battery limits, ZFSBootMenu config, and so on |
+| `local.conf.example` | every setting of this machine you can change - battery limits, compressed swap, atop, the desktop's memory cap - explained; copy it to `local.conf` to use it |
 | `LICENSE` | the MIT license |
 | `PACKED` | in a packed archive only: which version of the scripts this is |
 
@@ -232,10 +233,10 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
   changed since, until you remove them with `sudo zfs destroy -r gentoo@<name>`.
 - **Battery** (laptops with charge thresholds, such as ThinkPads): on a dock - any Thunderbolt
   device connected - it charges between 75 and 80 %, which is kinder to a battery that lives
-  plugged in; anywhere else to 100 %. `battery-limits status` shows the state; before a trip
-  `sudo battery-limits full` charges to 100 % on the dock too, until you undock or reboot. On the
-  dock between the limits the battery says "Not charging": expected. Laptops without charge
-  thresholds are left alone.
+  plugged in; anywhere else to 100 % (other limits: `local.conf`). `battery-limits status` shows
+  the state; before a trip `sudo battery-limits full` charges to 100 % on the dock too, until you
+  undock or reboot. On the dock between the limits the battery says "Not charging": expected.
+  Laptops without charge thresholds are left alone.
 - **More users:** Settings -> User Accounts, or
 
       sudo useradd -m -s /bin/bash -G audio,video,usb,input,plugdev NAME    # add wheel for sudo
@@ -247,12 +248,22 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
 - **Home folders** are readable by the other users (mode 755, `HOME_MODE` in `/etc/login.defs`),
   so you can share files; `chmod 700 ~` makes yours private. Programs keep their own secrets (SSH
   and GnuPG keys, browser profiles) private either way.
-- **System files** all come from `files/` (listed in `deploy.list`). To change one, edit it in
+- **Your own settings** go in `~/gentoo-laptop/local.conf`, which git ignores, so updates never
+  touch it: `cp local.conf.example local.conf` once, remove the `#` in front of a setting and
+  change its value, then `sudo ./deploy`. `local.conf.example` explains every setting - battery
+  limits, the size and compression of the compressed swap, zswap, how often atop samples and how
+  long it keeps them, the re-dock timings, the desktop's memory cap - and when each takes effect.
+  deploy checks every line before installing it as `/etc/gentoo-laptop/local.conf`: a misspelt
+  name or a bad value stops it. Each laptop keeps its own; one in the folder you install from is
+  installed with the system.
+- **System files** all come from `files/` (listed in `deploy.list`). Whole configuration files
+  (the snapshot schedule, SSH, ZFSBootMenu, the initramfs) are changed there: edit one in
   `~/gentoo-laptop/files/`, then `sudo ./deploy` in `~/gentoo-laptop`: it shows every difference
   and asks before installing. `sudo ./deploy --dry-run` only shows.
 - **A newer version of the scripts** (from GitHub as in step 4, or a pack): unpack it next to the
-  old folder, carry over any changes of your own (`diff -ru ~/gentoo-laptop <new folder>` shows
-  them), then run `sudo ./deploy` from the new folder and use it from then on.
+  old folder, copy your `local.conf` over and carry over any changes of your own to `files/`
+  (`diff -ru ~/gentoo-laptop <new folder>` shows them), then run `sudo ./deploy` from the new
+  folder and use it from then on.
 - **Firmware** (BIOS, and other devices that support it) updates through fwupd:
   `sudo fwupdmgr refresh && sudo fwupdmgr get-updates`, then `sudo fwupdmgr update` - on the
   charger; the reboot applies it. fwupd's daemon starts by itself when needed.
@@ -262,8 +273,9 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
 
 So that nothing surprises you: compressed swap in RAM (zram) and no swap partition - under 16 GB
 of RAM instead an encrypted swap partition with zswap (its key is new at each boot, so there is no
-hibernation); the ZFS read cache capped (`ARC_MAX_GIB`); a soft memory cap on each desktop session, 5/8 of RAM (systemd's
-`MemoryHigh` without systemd; `MEMORY_HIGH=` in `/etc/session-memory-limit.conf` changes it); network settings so that a dock's Ethernet and the Wi-Fi can be on
+hibernation); the ZFS read cache capped (`ARC_MAX_GIB`); a soft memory cap on each desktop
+session, 5/8 of RAM (systemd's `MemoryHigh` without systemd; `SESSION_MEMORY_HIGH` in `local.conf`
+changes it); network settings so that a dock's Ethernet and the Wi-Fi can be on
 the same network at once without NetworkManager dropping both addresses; a small helper that puts
 windows back where they were when you re-dock; container images (with Podman) in
 /var/lib/containers/<user>, outside your home, so backups of /home skip them; a local patch to

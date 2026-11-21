@@ -1,0 +1,14 @@
+# interpreter caches (regenerated per machine)
+__pycache__/
+*.py[co]
+# handoff bundles are produced from the repository, never stored in it
+*.bundle
+# logs from runs belong to the machine that ran them
+*.log
+# editor and patch debris
+*~
+.*.swp
+*.orig
+*.rej
+# this machine's own settings (deploy installs it; local.conf.example is the template)
+local.conf

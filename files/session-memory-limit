@@ -7,9 +7,11 @@
 # (/sys/fs/cgroup/<session id>): above it the kernel reclaims the session's memory - into
 # compressed swap - and slows it, so a browser cannot crowd out the rest; nothing is killed.
 # Only the caller's own session: elogind must name the cgroup's session as the sudo caller's.
-# Size: 5/8 of RAM (32 GB: 20 GiB; 64 GB: 36 GiB). A fixed size
-# instead, e.g. MEMORY_HIGH=24G, in /etc/session-memory-limit.conf ("max": no cap), from the next
-# login. See it: cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.high
+# Size: 5/8 of RAM, 62.5 % (32 GB: 20 GiB; 64 GB: 36 GiB). Another from the next login:
+# SESSION_MEMORY_HIGH in local.conf (a setting of this machine) - a share of the RAM (50%, 62.5%;
+# 1 to 100), a size with its unit (24G) or max (no cap) - or as before MEMORY_HIGH=24G in
+# /etc/session-memory-limit.conf; local.conf wins when both are set.
+# See it: cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.high
 # What it did, or why it refused, goes to the system log as well as stderr:
 #     grep session-memory-limit /var/log/messages
 set -euo pipefail
@@ -25,13 +27,33 @@ die() { say warning "$*"; exit 1; }
 uid="${SUDO_UID:-}"
 [[ "$uid" =~ ^[0-9]+$ ]] || die "run it through sudo (no SUDO_UID: whose session?)"
 
-if [ -r "$CONF" ] && grep -q '^MEMORY_HIGH=' "$CONF"; then
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+# a share of the RAM (1-100 %, decimals allowed), a size with its unit (a bare number would be
+# bytes: 24 for 24G caps the session at 24 bytes), or max
+high="$(local_setting SESSION_MEMORY_HIGH '' '([1-9][0-9]?(\.[0-9]+)?|100)%|[1-9][0-9]*[KMGT]|max')"
+if [ -n "$high" ]; then
+    :   # from local.conf
+elif [ -r "$CONF" ] && grep -q '^MEMORY_HIGH=' "$CONF"; then
     high="$(grep '^MEMORY_HIGH=' "$CONF" | tail -n1 | cut -d= -f2- | tr -d '[:space:]"')"
     [[ "$high" =~ ^([0-9]+[KMGT]?|max)$ ]] || die "MEMORY_HIGH=$high in $CONF: not a size (like 24G) or max"
 else
+    high=62.5%   # 5/8
+fi
+if [[ "$high" == *% ]]; then   # a share of MemTotal, in MiB (floor; the guard keeps 62.5 % exact)
     kb="$(awk '/^MemTotal:/ {print $2}' "$MEMINFO")"
     [[ "$kb" =~ ^[0-9]+$ ]] || die "no MemTotal in $MEMINFO"
-    high="$(( kb * 5 / 8 / 1024 ))M"
+    high="$(awk -v k="$kb" -v p="${high%\%}" 'BEGIN {printf "%dM", int(k * p / 100 / 1024 + 1e-6)}')"
 fi
 
 cg="$(sed -n 's/^0:://p' "$SELF_CGROUP")"

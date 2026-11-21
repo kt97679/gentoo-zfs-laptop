@@ -3,7 +3,8 @@
 # booted by ZFSBootMenu that is BUILT LOCALLY from the installed kernel, ZFS and dracut.
 #
 # Run as root from the Gentoo minimal installation CD on the target laptop, inside the
-# gentoo-laptop checkout (deploy, deploy.list and files/ are used; copy the whole directory):
+# gentoo-laptop checkout (deploy, deploy.list and files/ are used, and local.conf - this machine's
+# settings, local.conf.example explains them - when there is one; copy the whole directory):
 #     bash install-gentoo.sh            (shows a menu of disks to choose from)
 #     DISK=/dev/disk/by-id/nvme-XXXX bash install-gentoo.sh   (skip the menu)
 # Root gets no password (account locked); administration is via sudo.
@@ -58,6 +59,16 @@ step() { printf '\n\033[1;32m>>> %s\033[0m\n' "$*"; }
 HERE="$(dirname "$(readlink -f "$0")")"   # the checkout: its system files are deployed in the chroot
 [ -x "$HERE/deploy" ] && [ -f "$HERE/deploy.list" ] && [ -d "$HERE/files" ] \
     || die "run this from the gentoo-laptop checkout: deploy, deploy.list and files/ must be next to it"
+check_local_conf() {   # local.conf (this machine's settings), checked by deploy now - not in the
+    # chroot an hour into the install - with a dry run into an empty directory
+    [ -f "$HERE/local.conf" ] || return 0
+    local chk; chk="$(mktemp -d)"
+    "$HERE/deploy" --root "$chk" --dry-run --group base > "$chk.out" 2>&1 \
+        || { cat "$chk.out" >&2; rm -rf "$chk" "$chk.out"; die "local.conf has errors (above) - fix them, or move it away, and run again"; }
+    rm -rf "$chk" "$chk.out"
+    echo "local.conf: this machine's settings, installed with the system files"
+}
+check_local_conf
 memory_plan() {   # memory_plan MEMTOTAL_KB THREADS - prints "RAM ARC SWAP JOBS": the RAM's nominal
     # size in GB (MemTotal up to a multiple of 4: firmware and integrated graphics keep part of it,
     # so a 16 GB laptop reports 13-15 GiB), the ZFS cache cap and the swap partition in GiB, and
@@ -518,6 +529,7 @@ echo "$LOCALE ${LOCALE##*.}" >> "$TARGET/etc/locale.gen"
 step "Entering chroot"
 mkdir -p "$TARGET/tmp/gentoo-laptop"   # what deploy needs, for the chroot; removed afterwards
 cp -a "$HERE/deploy" "$HERE/deploy.list" "$HERE/files" "$TARGET/tmp/gentoo-laptop/"
+[ ! -f "$HERE/local.conf" ] || cp "$HERE/local.conf" "$TARGET/tmp/gentoo-laptop/"   # deploy installs it too
 copy_live_ssh   # the live session's SSH key for the user, and its host keys
 mountpoint -q /sys/firmware/efi/efivars || mount -t efivarfs efivarfs /sys/firmware/efi/efivars
 mount --types proc /proc "$TARGET/proc"

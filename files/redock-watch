@@ -27,8 +27,20 @@
 LOGD="${XDG_STATE_HOME:-$HOME/.local/state}/redock-watch"
 LOGF="$LOGD/redock-watch.log"
 LOG_MAX=1048576
-QUIET=1        # seconds of calm before taking a window snapshot
-SETTLE=1       # seconds after the last monitor event before acting (try 0.5-2)
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+QUIET=$(local_setting REDOCK_QUIET '1' '[0-9]+(\.[0-9]+)?')     # seconds of calm before a window snapshot
+SETTLE=$(local_setting REDOCK_SETTLE '1' '[0-9]+(\.[0-9]+)?')   # seconds after the last monitor event (try 0.5-2)
 logging() {     # is the log on? if so: private modes, and a log past LOG_MAX moved aside
     [ -f "$LOGF" ] || return 1
     chmod 700 "$LOGD" 2>/dev/null; chmod 600 "$LOGF" 2>/dev/null

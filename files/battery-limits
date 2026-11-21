@@ -9,11 +9,34 @@
 #                                before a trip (80 to 100 % takes about an hour)
 #   sudo battery-limits normal   back to the rule
 #   battery-limits status        where the laptop is, the limits, the battery
-# The values below: change them in files/battery-limits of the gentoo-laptop checkout, then
-# sudo ./deploy. Docked between the limits the battery reports "Not charging" and the panel shows
-# no charging sign: expected (it charges again below the lower limit).
-DOCK_START=75 DOCK_END=80      # on the dock
-AWAY_START=99 AWAY_END=100     # anywhere else, and after "full"
+# The limits are settings of this machine: BATTERY_DOCK_START/END and BATTERY_AWAY_START/END in
+# local.conf of the gentoo-laptop checkout (local.conf.example explains them), then sudo ./deploy
+# and sudo battery-limits. Docked between the limits the battery reports "Not charging" and the
+# panel shows no charging sign: expected (it charges again below the lower limit).
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+DOCK_START=$(local_setting BATTERY_DOCK_START '75' '[0-9]|[1-9][0-9]')        # on the dock
+DOCK_END=$(local_setting BATTERY_DOCK_END '80' '[1-9]|[1-9][0-9]|100')
+AWAY_START=$(local_setting BATTERY_AWAY_START '99' '[0-9]|[1-9][0-9]')        # anywhere else, and
+AWAY_END=$(local_setting BATTERY_AWAY_END '100' '[1-9]|[1-9][0-9]|100')       # after "full"
+if [ "$DOCK_START" -ge "$DOCK_END" ]; then   # the firmware wants the start below the end
+    echo "battery-limits: BATTERY_DOCK_START=$DOCK_START is not below BATTERY_DOCK_END=$DOCK_END - 75-80 instead" >&2
+    DOCK_START=75 DOCK_END=80
+fi
+if [ "$AWAY_START" -ge "$AWAY_END" ]; then
+    echo "battery-limits: BATTERY_AWAY_START=$AWAY_START is not below BATTERY_AWAY_END=$AWAY_END - 99-100 instead" >&2
+    AWAY_START=99 AWAY_END=100
+fi
 PS="${BATTERY_LIMITS_PS:-/sys/class/power_supply}"            # (tests point these elsewhere)
 TB="${BATTERY_LIMITS_TB:-/sys/bus/thunderbolt/devices}"
 FLAG="${BATTERY_LIMITS_FLAG:-/run/battery-limits.full}"         # /run: gone at reboot

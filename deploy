@@ -11,6 +11,11 @@
 # deploy.list is removed only if nobody changed it. Changed sysctl files are applied and udev
 # rules reloaded. Destinations must be under /etc or /usr/local; sources must be regular files
 # inside the checkout; a sudoers file must pass visudo.
+# This machine's own settings: local.conf next to deploy.list (git ignores it; local.conf.example
+# explains every setting) is installed as /etc/gentoo-laptop/local.conf with any group, where the
+# scripts read it. Every line is checked first: the names, defaults and allowed values come from
+# the scripts' local_setting calls, so an unknown name or a bad value stops deploy - nothing
+# changed. Deleting local.conf removes the installed copy (like a file dropped from deploy.list).
 # The installers use it too:  deploy --root DIR --yes --group NAME   (DIR: the new system).
 # State - what was deployed with checksums, and the groups: /var/lib/deploy/.
 set -Eeuo pipefail
@@ -61,6 +66,46 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$list"
 if [ "${#bad[@]}" -gt 0 ]; then printf 'deploy: %s\n' "${bad[@]}" >&2; die "deploy.list has errors - nothing changed"; fi
 
+# --- local.conf: this machine's settings -------------------------------------------------------
+# The settings: every local_setting NAME 'DEFAULT' 'PATTERN' call in the files deploy.list names.
+LOCAL_DEST=/etc/gentoo-laptop/local.conf
+declare -A setting_pat setting_file
+call_re="^local_setting ([A-Z][A-Z0-9_]*) '([^']*)' '([^']*)'$"
+line_re='^([A-Za-z0-9_]+)=([^[:space:]#"'"'"']*)([[:space:]]+#.*|[[:space:]]*)$'   # NAME=VALUE [# comment]
+for s in $(printf '%s\n' "${src_of[@]}" | sort -u); do
+    while IFS= read -r call; do
+        [[ "$call" =~ $call_re ]] || continue
+        setting_pat[${BASH_REMATCH[1]}]="${BASH_REMATCH[3]}"; setting_file[${BASH_REMATCH[1]}]="$s"
+    done < <(grep -ho "local_setting [A-Z][A-Z0-9_]* '[^']*' '[^']*'" "$repo/$s" || true)
+done
+local_settings=0
+if [ -e "$repo/local.conf" ] || [ -L "$repo/local.conf" ]; then
+    lbad=()
+    if [ -L "$repo/local.conf" ] || [ ! -f "$repo/local.conf" ]; then
+        lbad+=("local.conf is not a regular file")
+    else
+        n=0
+        while IFS= read -r line || [ -n "$line" ]; do
+            n=$((n + 1))
+            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+            if [[ ! "$line" =~ $line_re ]]; then
+                lbad+=("local.conf line $n: '$line' - want NAME=VALUE (no spaces, no quotes; a comment after a space and #)")
+                continue
+            fi
+            name="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+            if [ -z "${setting_pat[$name]:-}" ]; then
+                lbad+=("local.conf line $n: no setting $name (the settings, explained: local.conf.example)")
+            elif [ -n "$val" ] && [[ ! "$val" =~ ^(${setting_pat[$name]})$ ]]; then
+                lbad+=("local.conf line $n: $name=$val is not valid - ${setting_file[$name]} takes: ${setting_pat[$name]} (see local.conf.example)")
+            else
+                local_settings=$((local_settings + 1))
+            fi
+        done < "$repo/local.conf"
+    fi
+    if [ "${#lbad[@]}" -gt 0 ]; then printf 'deploy: %s\n' "${lbad[@]}" >&2; die "local.conf has errors - nothing changed"; fi
+    src_of[$LOCAL_DEST]=local.conf; mode_of[$LOCAL_DEST]=0644; group_of[$LOCAL_DEST]=local; dests+=("$LOCAL_DEST")
+fi
+
 # --- groups and state ------------------------------------------------------------------------
 declare -A prev_sum prev_group
 recorded=()
@@ -74,7 +119,7 @@ done
 if [ "${#GROUPS_ASKED[@]}" -gt 0 ]; then selected=("${GROUPS_ASKED[@]}")
 elif [ "${#recorded[@]}" -gt 0 ]; then selected=("${recorded[@]}")
 else selected=("${all_groups[@]}"); echo "first deploy here: every group (${all_groups[*]})"; fi
-in_selected() { [[ " ${selected[*]} " == *" $1 "* ]]; }
+in_selected() { [ "$1" = local ] || [[ " ${selected[*]} " == *" $1 "* ]]; }   # local.conf: always
 
 # --- the checkout ----------------------------------------------------------------------------
 echo "checkout: $repo"
@@ -89,6 +134,8 @@ else
     echo "(not a git checkout - no commit to show)"
 fi
 echo "groups:   ${selected[*]}${ROOT:+   (root: $ROOT)}"
+if [ -n "${src_of[$LOCAL_DEST]:-}" ]; then echo "local.conf: $local_settings setting(s), installed as $LOCAL_DEST"
+else echo "local.conf: none - every setting at its default (local.conf.example explains them)"; fi
 
 # --- the plan ----------------------------------------------------------------------------------
 plan=() unchanged=0 problems=()

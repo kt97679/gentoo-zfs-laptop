@@ -2,18 +2,33 @@
 # /etc/local.d/zswap.start - zswap, a compressed cache in RAM in front of a swap partition (deployed
 # by ./deploy). Only when a swap partition is in use - the encrypted one the installer makes under
 # 16 GB of RAM (dmcrypt service, /etc/conf.d/dmcrypt); without one, zram.start sets up compressed
-# swap in RAM instead. Pages leaving RAM are compressed first (zstd, zsmalloc); the pool takes up to
-# 25 % of RAM, and its shrinker moves pages nobody touches on to the partition.
+# swap in RAM instead. Pages leaving RAM are compressed first (ZSWAP_COMPRESSOR, zstd unless
+# local.conf says otherwise; zsmalloc); the pool takes up to ZSWAP_POOL_PERCENT of RAM (25), and its
+# shrinker moves pages nobody touches on to the partition.
 # Its state: grep -r . /sys/module/zswap/parameters
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+COMP=$(local_setting ZSWAP_COMPRESSOR 'zstd' '[a-z0-9-]+')
+POOL=$(local_setting ZSWAP_POOL_PERCENT '25' '[1-9]|[1-9][0-9]|100')
 SWAPS="${SWAPS:-/proc/swaps}" P="${ZSWAP_PARAMS:-/sys/module/zswap/parameters}"   # (tests)
 awk 'NR > 1 && $1 !~ "^/dev/zram" {f = 1} END {exit !f}' "$SWAPS" || exit 0
 if [ ! -w "$P/enabled" ]; then
     echo "zswap.start: this kernel has no zswap - the swap partition works without it" >&2
     exit 0
 fi
-echo zstd > "$P/compressor" 2>/dev/null || echo "zswap.start: zstd refused, keeping $(cat "$P/compressor")" >&2
+echo "$COMP" > "$P/compressor" 2>/dev/null || echo "zswap.start: $COMP refused, keeping $(cat "$P/compressor")" >&2
 [ ! -e "$P/zpool" ] || echo zsmalloc > "$P/zpool"   # gone in 6.18: zsmalloc is the only allocator
-echo 25 > "$P/max_pool_percent"
+echo "$POOL" > "$P/max_pool_percent"
 [ ! -e "$P/shrinker_enabled" ] || echo Y > "$P/shrinker_enabled"
 echo Y > "$P/enabled"
-echo "zswap.start: zswap on ($(cat "$P/compressor"), up to 25 % of RAM)"
+echo "zswap.start: zswap on ($(cat "$P/compressor"), up to $(cat "$P/max_pool_percent") % of RAM)"

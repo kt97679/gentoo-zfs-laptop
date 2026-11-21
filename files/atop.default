@@ -2,9 +2,22 @@
 # its own copy of this file; after a package update Portage leaves its version as ._cfg0000_atop
 # (world-update reports it): keep this one. Read only by /usr/share/atop/atop.daily, which the atop
 # service (OpenRC) and /etc/cron.d/atop run. One sample a minute - upstream's 600 s misses an episode
-# of a few minutes - kept 28 days; about 10 KB a sample at 450 processes (13 MiB a day).
+# of a few minutes - kept 28 days; about 10 KB a sample at 450 processes (13 MiB a day). Both are
+# settings of this machine: ATOP_INTERVAL and ATOP_DAYS in local.conf.
 # Replay: atop -r /var/log/atop/atop_YYYYMMDD -b HH:MM  (m memory, c command lines, t/T step)
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
 LOGOPTS=""
-LOGINTERVAL=60
-LOGGENERATIONS=28
+LOGINTERVAL=$(local_setting ATOP_INTERVAL '60' '[1-9][0-9]*')
+LOGGENERATIONS=$(local_setting ATOP_DAYS '28' '[1-9][0-9]*')
 LOGPATH=/var/log/atop
