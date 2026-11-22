@@ -1,0 +1,259 @@
+#!/bin/bash
+# /usr/local/sbin/hotspot - share this laptop's connection over Wi-Fi with your own devices (your
+# phone, the family's), for example in a hotel that lets one device in per sign-in.
+#   sudo hotspot start     start it: the laptop stays connected as it is (Wi-Fi after the hotel's
+#                          sign-in page, or a cable) and serves a WPA2 network of its own besides;
+#                          shows its name, its passphrase and a QR code to scan with a phone
+#   sudo hotspot status    on or off, the name and passphrase, the devices connected
+#   sudo hotspot qr        the QR code again
+#   sudo hotspot stop      stop it; sudo hotspot restart: stop, then start (after the laptop moved
+#                          to another network)
+# How: a second, virtual interface (ap0) on the same Wi-Fi card - the QCNFA765 (ath11k) runs a
+# station and access points at once, on one channel or two - with hostapd as the access point,
+# dnsmasq handing out addresses and DNS on ap0 only, and nftables translating the hotspot's
+# addresses to the laptop's on the way out (NAT). From the hotspot only DHCP, DNS and ping reach
+# the laptop itself; nothing else of it is reachable from there. NetworkManager leaves ap0 alone
+# (/etc/NetworkManager/conf.d/50-hotspot-unmanaged.conf). Same channel as the network the laptop
+# is on, when that is in the hotspot's band: one radio then does not switch between two.
+# Settings of this machine (local.conf, explained in local.conf.example): HOTSPOT_SSID and
+# HOTSPOT_PASSPHRASE - empty: made up once at random and kept (/var/lib/hotspot, root only), so
+# devices that joined once rejoin - HOTSPOT_BAND and HOTSPOT_CHANNEL. Takes effect at the next
+# start. While it runs: /run/hotspot (configuration, the logs of hostapd and dnsmasq, leases).
+# Needs net-wireless/iw, net-wireless/hostapd, net-dns/dnsmasq; QR codes need media-gfx/qrencode.
+set -euo pipefail
+export LC_ALL=C
+RUN="${HOTSPOT_RUN:-/run/hotspot}" STATE="${HOTSPOT_STATE:-/var/lib/hotspot}"   # (tests point
+AP="${HOTSPOT_IFACE:-ap0}"                                                       #  these elsewhere)
+# local_setting NAME DEFAULT PATTERN - this machine's NAME from /etc/gentoo-laptop/local.conf
+# (local.conf in the gentoo-laptop checkout, installed by ./deploy; local.conf.example explains
+# every setting) when it is set and the whole value matches PATTERN, an extended regex; otherwise
+# DEFAULT, and a bad value is said on stderr. Every file that reads local.conf has this same copy.
+LOCAL_CONF="${LOCAL_CONF:-/etc/gentoo-laptop/local.conf}"   # (tests point it elsewhere)
+local_setting() {
+    _ls=""
+    [ ! -r "$LOCAL_CONF" ] || _ls="$(sed -n "s/^$1=\([^[:space:]#]*\).*/\1/p" "$LOCAL_CONF" | tail -n 1)"
+    if [ -z "$_ls" ]; then printf '%s\n' "$2"
+    elif printf '%s\n' "$_ls" | grep -Eqx -- "$3"; then printf '%s\n' "$_ls"
+    else echo "${0##*/}: $1=$_ls in $LOCAL_CONF is not valid - ${2:-the default} instead" >&2; printf '%s\n' "$2"; fi
+}
+SSID_SET=$(local_setting HOTSPOT_SSID '' '[A-Za-z0-9._-]{1,32}')
+PSK_SET=$(local_setting HOTSPOT_PASSPHRASE '' '[A-Za-z0-9._~!@$%^&*()+=,:;?/-]{8,63}')
+BAND=$(local_setting HOTSPOT_BAND 'bg' 'bg|a')
+CHANNEL=$(local_setting HOTSPOT_CHANNEL '0' '0|[1-9]|1[0-4]|3[2-9]|[4-9][0-9]|1[0-9][0-9]')
+
+say() { echo "hotspot: $*"; }
+die() { echo "hotspot: $*" >&2; exit 1; }
+
+uplink() {   # the interface of the default IPv4 route: the connection to share
+    ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}'
+}
+chan_freq() {   # chan_freq IFACE - "CHANNEL MHZ" of a Wi-Fi interface, empty when it has none
+    iw dev "$1" info 2>/dev/null | awk '$1 == "channel" {f = $3; gsub(/[^0-9]/, "", f); print $2, f; exit}'
+}
+plan_channel() {   # plan_channel BAND WANTED UPLINK_CHANNEL UPLINK_MHZ - the hotspot's channel:
+    # the one asked for; else the uplink's when it is in the band (one channel for the radio);
+    # else 6 (2.4 GHz) or 36 (5 GHz)
+    local band="$1" want="$2" ch="${3:-}" mhz="${4:-0}"
+    if [ "$want" != 0 ]; then echo "$want"
+    elif [ "$band" = bg ] && [ -n "$ch" ] && [ "$mhz" -ge 2400 ] && [ "$mhz" -lt 2500 ]; then echo "$ch"
+    elif [ "$band" = a ] && [ -n "$ch" ] && [ "$mhz" -ge 5150 ] && [ "$mhz" -lt 5900 ]; then echo "$ch"
+    elif [ "$band" = bg ]; then echo 6
+    else echo 36; fi
+}
+ip2int() { local a b c d; IFS=. read -r a b c d <<<"$1"; echo $(( (a << 24) + (b << 16) + (c << 8) + d )); }
+pick_net() {   # pick_net "CIDR..." - a /24 for the hotspot that overlaps none of these networks
+    # (the /24's .1 inside one of them, or one of them inside the /24)
+    local net a cidr base bits
+    for net in 10.42.0 10.43.0 172.31.237 172.30.237; do
+        a=$(ip2int "$net.1")
+        for cidr in $1; do
+            base=$(ip2int "${cidr%/*}") bits="${cidr#*/}"
+            [ "$bits" -gt 0 ] || continue
+            if [ $(( (a ^ base) >> (32 - bits) )) = 0 ] || [ $(( (a ^ base) >> 8 )) = 0 ]; then continue 2; fi
+        done
+        echo "$net"; return 0
+    done
+    return 1
+}
+ap_mac() {   # ap_mac MAC - a MAC for ap0 that differs from the card's: locally administered, the
+    # last byte changed
+    local IFS=: m; read -r -a m <<<"$1"
+    printf '%02x:%s:%s:%s:%s:%02x\n' $(( 0x${m[0]} | 0x02 )) "${m[1]}" "${m[2]}" "${m[3]}" "${m[4]}" $(( 0x${m[5]} ^ 0x01 ))
+}
+gen_passphrase() {   # 16 letters and digits, none that look alike, in groups of 4 (80 bits)
+    head -c 1024 /dev/urandom | tr -dc 'abcdefghijkmnpqrstuvwxyz23456789' | cut -c1-16 | sed 's/.\{4\}/&-/g; s/-$//'
+}
+gen_ssid() {   # the default hotspot name of stock Android phones: AndroidAP_ and four digits
+    printf 'AndroidAP_%04d\n' $(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 10000 ))
+}
+kept() {   # kept NAME GENERATOR - the value made up and kept in $STATE/NAME, made up now if none
+    if [ ! -s "$STATE/$1" ]; then
+        (umask 077; mkdir -p "$STATE"; "$2" > "$STATE/$1.new" && mv "$STATE/$1.new" "$STATE/$1")
+    fi
+    cat "$STATE/$1"
+}
+ssid() { if [ -n "$SSID_SET" ]; then echo "$SSID_SET"; else kept ssid gen_ssid; fi; }
+passphrase() { if [ -n "$PSK_SET" ]; then echo "$PSK_SET"; else kept passphrase gen_passphrase; fi; }
+alive() { [ -s "$RUN/$1.pid" ] && kill -0 "$(cat "$RUN/$1.pid")" 2>/dev/null; }
+running() { alive hostapd; }
+
+nm_release() {   # NetworkManager must not take ap0: hostapd then finds it busy in station mode and
+    # says only "Could not connect to kernel driver" (seen on the first real run: the managed-no
+    # came a split second before NetworkManager knew ap0). The conf.d file covers it once
+    # NetworkManager has read it; until then, wait for NetworkManager to list ap0 unmanaged.
+    command -v nmcli >/dev/null && nmcli -t -f RUNNING general >/dev/null 2>&1 || return 0
+    local st=""
+    for _ in $(seq 40); do
+        st="$(nmcli -t -f DEVICE,STATE device 2>/dev/null | sed -n "s/^$AP://p")"
+        case "$st" in
+            unmanaged) return 0 ;;
+            "") ;;   # not listed (yet)
+            *) nmcli device set "$AP" managed no >/dev/null 2>&1 || true ;;
+        esac
+        sleep 0.25
+    done
+    [ -z "$st" ] || [ "$st" = unmanaged ] \
+        || { stop; die "NetworkManager keeps $AP ($st) - sudo rc-service NetworkManager restart, then start again"; }
+}
+
+qr() {   # the WIFI: text phones read from a QR code (\ ; , : " escaped)
+    local s p; s="$(ssid | sed 's/[\;,:"]/\\&/g')" p="$(passphrase | sed 's/[\;,:"]/\\&/g')"
+    if command -v qrencode >/dev/null; then qrencode -t ANSIUTF8 "WIFI:T:WPA;S:$s;P:$p;;"
+    else say "(no QR code: sudo emerge --ask media-gfx/qrencode)"; fi
+}
+
+stop() {
+    local p
+    for p in hostapd dnsmasq; do
+        if alive "$p"; then
+            kill "$(cat "$RUN/$p.pid")" 2>/dev/null || true
+            for _ in 1 2 3 4 5 6 7 8 9 10; do alive "$p" || break; sleep 0.3; done
+        fi
+        rm -f "$RUN/$p.pid"
+    done
+    nft delete table inet hotspot 2>/dev/null || true
+    [ ! -e "/sys/class/net/$AP" ] || iw dev "$AP" del 2>/dev/null || true
+    if [ -s "$RUN/ip_forward" ]; then sysctl -qw "net.ipv4.ip_forward=$(cat "$RUN/ip_forward")" || true; fi
+    rm -f "$RUN/ip_forward" "$RUN/info"
+}
+
+start() {
+    local t missing="" up phy ch="" mhz="" mac net chan mode fwd ssid psk
+    for t in iw ip hostapd dnsmasq nft; do command -v "$t" >/dev/null || missing="$missing $t"; done
+    [ -z "$missing" ] || die "missing:$missing - sudo emerge --ask net-wireless/iw net-wireless/hostapd net-dns/dnsmasq"
+    if running; then say "already on"; status; return 0; fi
+    stop   # what an earlier run left behind
+    up="$(uplink)"
+    [ -n "$up" ] || die "no connection to share - connect first (in a hotel: its Wi-Fi, then its sign-in page in the browser)"
+    [ "$up" != "$AP" ] || die "the default route goes through $AP itself"
+    if [ -e "/sys/class/net/$up/phy80211/name" ]; then
+        phy="$(cat "/sys/class/net/$up/phy80211/name")"
+        t="$(chan_freq "$up")"; ch="${t% *}" mhz="${t#* }"
+    else
+        phy=""
+        for t in /sys/class/ieee80211/*; do [ -e "$t" ] && { phy="${t##*/}"; break; }; done
+        [ -n "$phy" ] || die "no Wi-Fi card"
+    fi
+    chan="$(plan_channel "$BAND" "$CHANNEL" "$ch" "${mhz:-0}")"
+    if [ "$BAND" = bg ]; then mode=g; else mode=a; fi
+    net="$(pick_net "$(ip -4 -o addr show | awk '{print $4}')")" || die "no free private network for the hotspot"
+    mac="$(ap_mac "$(cat "/sys/class/ieee80211/$phy/macaddress")")"
+    ssid="$(ssid)" psk="$(passphrase)"
+    (umask 077; mkdir -p "$RUN")
+
+    # NetworkManager re-reads its configuration (the conf.d file for ap0, if it has not since deploy)
+    if command -v nmcli >/dev/null; then nmcli general reload conf >/dev/null 2>&1 || true; fi
+    iw phy "$phy" interface add "$AP" type __ap \
+        || die "the Wi-Fi card ($phy) did not take a second interface - iw list shows what it can do"
+    nm_release
+    ip link set "$AP" down; iw dev "$AP" set type __ap 2>/dev/null || true   # as hostapd wants it
+    ip link set "$AP" address "$mac"
+    sysctl -qw "net.ipv6.conf.$AP.disable_ipv6=1" 2>/dev/null || true   # IPv4 only: nothing to hand out
+    ip addr add "$net.1/24" dev "$AP"
+    cat > "$RUN/hostapd.conf" <<EOF
+# written by hotspot - $(date)
+interface=$AP
+driver=nl80211
+ctrl_interface=$RUN/hostapd
+ssid=$ssid
+hw_mode=$mode
+channel=$chan
+ieee80211n=1
+wmm_enabled=1
+auth_algs=1
+wpa=2
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+wpa_passphrase=$psk
+EOF
+    if ! hostapd -B -P "$RUN/hostapd.pid" -f "$RUN/hostapd.log" "$RUN/hostapd.conf" >/dev/null 2>&1; then
+        local why   # hostapd's reason, or its last lines
+        why="$(grep -iE 'not allowed|no-ir|could not|failed|invalid|unsupported' "$RUN/hostapd.log" 2>/dev/null | head -n 3)"
+        [ -n "$why" ] || why="$(tail -n 3 "$RUN/hostapd.log" 2>/dev/null)"
+        why="  ${why//$'\n'/$'\n'  }"
+        local hint="  (more: $RUN/hostapd.log)"
+        [ "$BAND" != a ] || hint="  (5 GHz needs the country to allow it: iw reg get; HOTSPOT_BAND=bg is the safe choice)"
+        stop; die "the access point did not start on channel $chan ($BAND):"$'\n'"$why"$'\n'"$hint"
+    fi
+    for _ in $(seq 40); do iw dev "$AP" info 2>/dev/null | grep -q "ssid $ssid" && break; sleep 0.25; done
+    iw dev "$AP" info 2>/dev/null | grep -q "ssid $ssid" || { stop; die "the access point did not come up - $RUN/hostapd.log"; }
+    if ! dnsmasq --conf-file=/dev/null --interface="$AP" --except-interface=lo --bind-interfaces \
+        --listen-address="$net.1" --dhcp-range="$net.10,$net.250,255.255.255.0,12h" --dhcp-authoritative \
+        --dhcp-option=option:router,"$net.1" --dhcp-option=option:dns-server,"$net.1" \
+        --dhcp-leasefile="$RUN/leases" --pid-file="$RUN/dnsmasq.pid" --log-facility="$RUN/dnsmasq.log" --log-dhcp; then
+        stop; die "dnsmasq did not start - $RUN/dnsmasq.log"
+    fi
+    fwd="$(cat /proc/sys/net/ipv4/ip_forward)"
+    cat > "$RUN/nft.rules" <<EOF
+table inet hotspot {
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname "$AP" ct state established,related accept
+        iifname "$AP" udp dport { 53, 67 } accept
+        iifname "$AP" tcp dport 53 accept
+        iifname "$AP" icmp type echo-request accept
+        iifname "$AP" counter drop
+    }
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "$AP" oifname "$up" accept
+        iifname "$up" oifname "$AP" ct state established,related accept
+        iifname "$AP" counter drop
+        oifname "$AP" counter drop
+        $([ "$fwd" = 1 ] || echo 'ct state new counter drop   # forwarding was off: nothing else new now')
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr $net.0/24 oifname "$up" masquerade
+    }
+}
+EOF
+    nft -f "$RUN/nft.rules" || { stop; die "nftables refused the hotspot's rules ($RUN/nft.rules)"; }
+    echo "$fwd" > "$RUN/ip_forward"
+    sysctl -qw net.ipv4.ip_forward=1
+    echo "uplink=$up phy=$phy channel=$chan band=$BAND net=$net.0/24" > "$RUN/info"
+    say "on - sharing $up on channel $chan"
+    status
+}
+
+status() {
+    if ! running; then say "off"; return 0; fi
+    local n
+    say "name:       $(ssid)"
+    say "passphrase: $(passphrase)"
+    say "$(sed 's/ /, /g' "$RUN/info" 2>/dev/null)"
+    n="$(iw dev "$AP" station dump 2>/dev/null | grep -c '^Station' || true)"
+    say "devices connected: $n"
+    if [ -s "$RUN/leases" ]; then awk '{printf "hotspot:   %-15s %s\n", $3, ($4 == "*" ? $2 : $4)}' "$RUN/leases"; fi
+    if [ "${1:-}" != brief ]; then qr; fi
+}
+
+[ "$(id -u)" = 0 ] || exec sudo -- "$0" "$@"
+case "${1:-}" in
+    start)   start ;;
+    stop)    if running; then stop; say "off"; else stop; say "was off"; fi ;;
+    restart) stop; start ;;
+    status)  status brief ;;
+    qr)      if running; then qr; else say "off"; fi ;;
+    *)       echo "usage: sudo hotspot start | stop | restart | status | qr" >&2; exit 2 ;;
+esac

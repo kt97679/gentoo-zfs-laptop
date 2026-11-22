@@ -237,6 +237,18 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
   the state; before a trip `sudo battery-limits full` charges to 100 % on the dock too, until you
   undock or reboot. On the dock between the limits the battery says "Not charging": expected.
   Laptops without charge thresholds are left alone.
+- **Wi-Fi hotspot** for your own devices, say in a hotel that lets one device in per sign-in:
+  connect the laptop (the hotel's Wi-Fi and its sign-in page, or a cable), then
+  `sudo hotspot start`. The laptop stays connected and serves a WPA2 network of its own on the
+  same Wi-Fi card; it shows the name, the passphrase and a QR code for phones (`sudo hotspot qr`
+  again, `sudo hotspot status` for the devices connected, `sudo hotspot stop`). By default the name
+  is `AndroidAP_` and four digits, like a stock Android phone's hotspot, and the passphrase is
+  random - both made up once and kept; `HOTSPOT_SSID`, `HOTSPOT_PASSPHRASE`, the band and the
+  channel are `local.conf` settings. From the hotspot, devices reach the internet and, of the
+  laptop, only addresses, DNS and ping. It needs a card that runs a station and an access point
+  at once (`iw list`, "valid interface combinations"; the ThinkPad P14s Gen 5 AMD's Qualcomm card
+  does, connected on 5 GHz while serving on 2.4 GHz); 2.4 GHz works anywhere, 5 GHz once the
+  country is known (`iw reg get`).
 - **More users:** Settings -> User Accounts, or
 
       sudo useradd -m -s /bin/bash -G audio,video,usb,input,plugdev NAME    # add wheel for sudo
@@ -252,7 +264,8 @@ To start the base install over, run `install-gentoo.sh` again; if the pool is st
   touch it: `cp local.conf.example local.conf` once, remove the `#` in front of a setting and
   change its value, then `sudo ./deploy`. `local.conf.example` explains every setting - battery
   limits, the size and compression of the compressed swap, zswap, how often atop samples and how
-  long it keeps them, the re-dock timings, the desktop's memory cap - and when each takes effect.
+  long it keeps them, the re-dock timings, the desktop's memory cap, the hotspot's name and
+  passphrase - and when each takes effect.
   deploy checks every line before installing it as `/etc/gentoo-laptop/local.conf`: a misspelt
   name or a bad value stops it. Each laptop keeps its own; one in the folder you install from is
   installed with the system.

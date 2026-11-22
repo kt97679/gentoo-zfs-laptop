@@ -105,6 +105,29 @@
 # over MEMORY_HIGH in /etc/session-memory-limit.conf, the older place for this.
 #SESSION_MEMORY_HIGH=
 
+# --- Wi-Fi hotspot for your own devices (sudo hotspot start: /usr/local/sbin/hotspot) -------------
+# Shares the laptop's connection - a hotel's Wi-Fi after its sign-in page, or a cable - with your
+# phone and the family's over a WPA2 network of the laptop's own, while the laptop stays connected.
+# From the hotspot, devices reach the internet, and of the laptop only addresses, DNS and ping.
+# Takes effect: at the next "sudo hotspot start" (or "sudo hotspot restart" while it runs).
+# "sudo hotspot status" shows the name and passphrase in use; "sudo hotspot qr" a QR code for phones.
+# The network's name (1-32 letters, digits, . _ -). Empty (the default): AndroidAP_ and four
+# digits, made up once and kept - the name stock Android phones give their own hotspot, so it
+# looks like one more phone among the many in a hotel. Spaces are not possible here.
+#HOTSPOT_SSID=
+# The passphrase (8-63 of letters, digits and . _ ~ ! @ $ % ^ & * ( ) + = , : ; ? / -). Empty (the
+# default): 16 letters and digits, made up once and kept, so devices that joined once rejoin.
+# It sits in local.conf in clear text, readable by every account on this laptop: fine for a
+# hotspot key you hand to family, not for a password that matters elsewhere.
+#HOTSPOT_PASSPHRASE=
+# The band: bg is 2.4 GHz - every device, longer reach, allowed everywhere without a country set;
+# a is 5 GHz - faster, but only once the country allows an access point there (iw reg get shows
+# it; the hotel's network usually tells the laptop its country after you connect).
+#HOTSPOT_BAND=bg
+# The channel; 0 (the default): the one the laptop's own Wi-Fi is on when that is in the band -
+# one channel for the radio is the fastest - else 6 (2.4 GHz) or 36 (5 GHz).
+#HOTSPOT_CHANNEL=0
+
 # --- Not here ------------------------------------------------------------------------------------
 # Whole configuration files are still changed in files/ and deployed: the snapshot schedule
 # (files/sanoid.conf), SSH (files/sshd-keys-only.conf), ZFSBootMenu (files/zfsbootmenu-config.yaml)

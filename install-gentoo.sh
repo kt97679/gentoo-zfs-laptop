@@ -575,6 +575,7 @@ emerge --quiet-build=y --noreplace \
     net-vpn/tor net-analyzer/nmap net-analyzer/tcpdump app-misc/byobu \
     app-shells/bash-completion sys-process/lsof sys-process/htop sys-process/atop sys-apps/pciutils \
     sys-apps/lshw app-admin/logrotate sys-apps/bolt sys-fs/sanoid sys-apps/fwupd \
+    net-wireless/iw net-wireless/hostapd net-dns/dnsmasq media-gfx/qrencode \
     ${SWAP_PARTUUID:+sys-fs/cryptsetup}   # the swap partition's encryption (dmcrypt service)
 
 step "System files of this project (deploy, group base)"

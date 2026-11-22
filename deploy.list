@@ -21,6 +21,8 @@ base     0755  /etc/shadow-maint/userdel-post.d/50-zfs-home                     
 base     0644  /etc/udev/rules.d/90-battery-limits.rules                        files/90-battery-limits.rules
 base     0755  /etc/cron.daily/portage-sync                                     files/portage-sync
 base     0644  /etc/sysctl.d/50-arp-one-subnet.conf                             files/50-arp-one-subnet.conf
+base     0755  /usr/local/sbin/hotspot                                          files/hotspot
+base     0644  /etc/NetworkManager/conf.d/50-hotspot-unmanaged.conf             files/nm-hotspot-unmanaged.conf
 base     0644  /etc/ssh/sshd_config.d/10-keys-only.conf                         files/sshd-keys-only.conf
 base     0644  /etc/default/atop                                                files/atop.default
 base     0644  /etc/cron.d/atop                                                 files/atop.cron
